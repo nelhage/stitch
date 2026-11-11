@@ -13,7 +13,8 @@ The primary use case for a `stitch` stream is to run **another** "ssh" instance 
 
 # Interface
 - `stitch tunnel <HOST> [[<DEST>:]<PORT>]` will establish a reliable tunnel to `<DEST>:<PORT>`. It acts similarly to `netcat` -- i.e., its stdin and stdout will be connected to a connection to `<DEST>:<PORT>`  -- except that the connection is static and resilient to network failures or changes.
-    - If `PORT` is not specified, it will be inferred based on `SSH_CONNECTION` to match the host's `ssh` server port.
+    - If only `PORT` is specified, `localhost` is assumed.
+    - If neither `HOST` nor `PORT` is not specified, the port will be inferred based on `SSH_CONNECTION` to match the host's `ssh` server port.
     - Instead of a host/port, the user can also specify `stitch tunnel -- command...` to directly execute a command on the remote server and conect to that.
 - The connection is proxied via one or more `ssh` connections to `<HOST>`. In common use, `<HOST>` and `<DEST>` will either be identical, or `<DEST>` may be `localhost`, such that you are connecting to `HOST` via itself.
     - However, setting `HOST` and `DEST` to distinct addresses can be useful in order to use `HOST` as a jump box or bastion to reach `DEST`
