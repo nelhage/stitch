@@ -30,7 +30,7 @@ The primary use case for a `stitch` stream is to run **another** "ssh" instance 
 The server's reply in the setup handshake (see "Tunnel setup", below) contains the path to a rendezvous socket (located in `$XDG_RUNTIME_DIR` on the server, falling back to `/tmp`).
 
 ## Proxying data
-The proxies communicate over the `ssh` channel. They speak a minimal "transport" protocol, which encapsulates data and acknowledges received data. Each proxy retains a buffer of sent-but-unacknowledged data for use during a resumption. The buffer is sized larger than a typical TCP send buffer to absorb flow during an extended offline window, but is fixed-size; if the buffer fills up, the proxy stops reading from the corresponding fd and relies on the underlying transport to eventually backpressure the sender.
+The proxies communicate over the `ssh` channel. They speak a minimal "transport" protocol, which encapsulates data and acknowledges received data; its wire format is specified in `framing.md`. Each proxy retains a buffer of sent-but-unacknowledged data for use during a resumption. The buffer is sized larger than a typical TCP send buffer to absorb flow during an extended offline window, but is fixed-size; if the buffer fills up, the proxy stops reading from the corresponding fd and relies on the underlying transport to eventually backpressure the sender.
 
 Each proxy also holds a bounded buffer of data it has received but not yet delivered to its local application, and advertises the free space in that buffer to its peer, which never sends beyond it (see "Flow control", below). As a result, a proxy never stops reading from the transport, even if its local application has stopped reading.
 
@@ -119,7 +119,7 @@ With flow control in place, the traffic timeout measures the health of the trans
 - The receive buffer capacity is local configuration. The two ends need not agree on it, and it is not negotiated; each end simply advertises what it has.
 - It is independent of the send buffer, which remains large in order to absorb data during an offline window.
 - The receive buffer bounds throughput to roughly "capacity / round-trip time", so it should default to a few MiB, comparable to `ssh`'s own channel window.
-- Frames have a modest maximum payload size (e.g. 64KiB), so that a fresh acknowledgement and window are never stuck behind a single very large frame.
+- Frames have a modest maximum payload size (65535 bytes; see `framing.md`), so that a fresh acknowledgement and window are never stuck behind a single very large frame.
 
 ## Tunnel setup
 
