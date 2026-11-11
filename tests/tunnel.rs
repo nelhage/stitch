@@ -714,14 +714,16 @@ fn hangup_finishes_the_session() {
     let mut stdout = t.stdout.take().unwrap();
     stdin.write_all(b"ping").unwrap();
     assert_eq!(read_n(&mut stdout, 4), b"ping");
+    // Unlike ssh, signal before closing stdin and stdout: otherwise the
+    // session may finish before the signal is even handled.
+    signal(t.child.id() as i32, Signal::SIGHUP);
+    wait_for_client_log(&env, "hung up");
     stdin.write_all(b"bye").unwrap();
     drop(stdin);
     drop(stdout);
-    signal(t.child.id() as i32, Signal::SIGHUP);
     let status = t.wait();
     assert!(status.success(), "{status}");
     assert_eq!(server.join().unwrap(), 7);
-    assert!(client_log(&env).contains("hung up"));
     env.assert_cleaned_up();
 }
 
