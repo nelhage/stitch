@@ -228,6 +228,26 @@ fn peer_duplicate_after_resync_detected() {
 }
 
 #[test]
+fn peer_duplicate_after_exact_catch_up_detected() {
+    // After a swap, a frame which ends exactly at the high-water mark
+    // resynchronizes the channel; a duplicate after it is an error.
+    let mut l = Loop::established();
+    l.a.swap_channel(l.now);
+    let hwm = l.a.recv_high_water_mark();
+    let mut h = honest_header(&l.a);
+    h.first = true;
+    h.seq = hwm - 5;
+    l.a.receive(&frame(h, &[2; 5]), l.now).unwrap();
+    assert_eq!(l.a.recv_high_water_mark(), hwm);
+    assert!(l.a.channel_resynced());
+    let mut h = honest_header(&l.a);
+    h.seq = hwm - 1;
+    expect(&mut l, &frame(h, b"xy"), |e| {
+        matches!(e, ProtocolError::BehindHighWaterMark { .. })
+    });
+}
+
+#[test]
 fn peer_missing_first_detected() {
     let mut l = Loop::established();
     l.a.swap_channel(l.now);

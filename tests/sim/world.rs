@@ -106,6 +106,16 @@ struct End {
     exit_channel: Option<usize>,
     peer_on_channel_at_exit: bool,
     flush_incomplete: bool,
+    /// When the session last produced a frame.
+    last_produced: Tick,
+    /// When bytes were last fed to `receive` (or the channel installed).
+    last_rx: Tick,
+    /// When pending output last made progress (or was produced, or the
+    /// channel installed).
+    last_tx: Tick,
+    /// Since when (as seen between steps) received data has been
+    /// unacknowledged.
+    unacked_since: Option<Tick>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +285,10 @@ impl World {
                 exit_channel: None,
                 peer_on_channel_at_exit: false,
                 flush_incomplete: false,
+                last_produced: 0,
+                unacked_since: None,
+                last_rx: 0,
+                last_tx: 0,
             }
         });
         let mut agenda: Vec<(Tick, Ev)> = p
@@ -861,6 +875,7 @@ impl World {
             self.rng.usize_log(64, 1 << 17)
         };
         let t = self.inst(now);
+        self.ends[x].last_rx = now;
         for chunk in buf.chunks(piece) {
             if let Err(err) = self.ends[x].s.receive(chunk, t) {
                 self.fail(format!(
@@ -904,6 +919,9 @@ impl World {
         let old = self.ends[SERVER].active.replace(ci);
         let t = self.inst(now);
         self.ends[SERVER].s.swap_channel(t);
+        self.ends[SERVER].last_rx = now;
+        self.ends[SERVER].last_tx = now;
+        self.check_first_frame_ready(SERVER);
         self.ends[SERVER].fail_seen = false;
         self.chans[ci].phase[SERVER] = Phase::Active;
         if let Some(o) = old {
@@ -1054,6 +1072,9 @@ impl World {
         let old = self.ends[CLIENT].active.replace(a.ch);
         let t = self.inst(now);
         self.ends[CLIENT].s.swap_channel(t);
+        self.ends[CLIENT].last_rx = now;
+        self.ends[CLIENT].last_tx = now;
+        self.check_first_frame_ready(CLIENT);
         self.ends[CLIENT].fail_seen = false;
         self.chans[a.ch].phase[CLIENT] = Phase::Active;
         if let Some(o) = old
@@ -1301,8 +1322,28 @@ impl World {
         }
         let before = e.s.frames_sent();
         let was = e.s.transport_timed_out();
+        // The documented condition, as the harness sees it.
+        let to = e.s.config().timeout.as_micros() as Tick;
+        let dead = now >= e.last_rx + to || (e.s.tx_pending() > 0 && now >= e.last_tx + to);
         let i = self.inst(now);
         self.ends[x].s.handle_timeout(i);
+        let timed_out = self.ends[x].s.transport_timed_out();
+        if dead && !timed_out {
+            self.fail(format!(
+                "{}: transport not reported as timed out, although nothing was received since {} or output was stuck since {}",
+                NAME[x],
+                fmt_t(self.ends[x].last_rx),
+                fmt_t(self.ends[x].last_tx)
+            ));
+        }
+        if !dead && timed_out && !was {
+            self.fail(format!(
+                "{}: transport reported as timed out, although data was received at {} and output progressed at {}",
+                NAME[x],
+                fmt_t(self.ends[x].last_rx),
+                fmt_t(self.ends[x].last_tx)
+            ));
+        }
         if due
             && let Some(t2) = self.ends[x].s.poll_timeout()
             && self.tick(t2) <= now
@@ -1348,6 +1389,9 @@ impl World {
         if n == 0 {
             return;
         }
+        self.ends[x].last_produced = self.now;
+        self.ends[x].last_tx = self.now;
+        let s = &mut self.ends[x].s;
         let limit = s.send_limit();
         let data = s.transmit_data(t).to_vec();
         if n > 1 || data.len() < HEADER_LEN {
@@ -1391,16 +1435,89 @@ impl World {
             let data = self.ends[x].s.transmit_data(t).to_vec();
             self.check_produced(x, before);
             if data.is_empty() {
+                self.check_nothing_to_send(x);
                 break;
             }
             let n = self.chans[ci].pipes[x].write(now, &data);
             if n > 0 {
                 self.tap(x, ci, &data[..n]);
                 self.ends[x].s.consume_transmit(n, t);
+                self.ends[x].last_tx = now;
             }
             if n < data.len() {
                 break;
             }
+        }
+    }
+
+    /// After a swap the timeout is cleared, and ("it immediately sends a
+    /// frame on the new channel") a `FIRST` frame is ready to write.
+    fn check_first_frame_ready(&mut self, x: usize) {
+        if self.ends[x].s.transport_timed_out() {
+            self.fail(format!(
+                "{}: transport_timed_out() not cleared by a swap",
+                NAME[x]
+            ));
+        }
+        let t = self.inst(self.now);
+        let before = self.ends[x].s.frames_sent();
+        self.ends[x].s.transmit_data(t);
+        self.check_produced(x, before);
+        let data = self.ends[x].s.transmit_data(t);
+        let first = data.len() >= HEADER_LEN
+            && FrameHeader::decode(data[..HEADER_LEN].try_into().unwrap()).is_ok_and(|h| h.first);
+        if !first {
+            self.fail(format!(
+                "{}: no FIRST frame ready right after a swap",
+                NAME[x]
+            ));
+        }
+    }
+
+    /// `x` has just declined to produce a frame: none of the reasons in the
+    /// frame-sending policy (`doc/implementation.md`) may hold.
+    fn check_nothing_to_send(&self, x: usize) {
+        let e = &self.ends[x];
+        let s = &e.s;
+        let c = s.config();
+        let mut err = Vec::new();
+        // And the timers for heartbeats and delayed acknowledgements are set.
+        let poll = s.poll_timeout().map(|t| self.tick(t));
+        let hb = e.last_produced + c.heartbeat_interval.as_micros() as Tick;
+        if poll.is_none_or(|p| p > hb) {
+            err.push("poll_timeout() is later than the next heartbeat");
+        }
+        if let Some(u) = e.unacked_since
+            && s.recv_high_water_mark() > s.ack_sent()
+            && poll.is_none_or(|p| p > u + c.ack_delay.as_micros() as Tick)
+        {
+            err.push("poll_timeout() is later than the delayed acknowledgement");
+        }
+        let (pos, end) = (s.send_position(), s.send_data_end());
+        if pos < end && pos < s.send_limit() {
+            err.push("data is ready to send below the send limit");
+        }
+        if s.send_closed() && pos == end {
+            err.push("the shutdown is ready to send");
+        }
+        let hwm = s.recv_high_water_mark();
+        if s.peer_shutdown().is_some() && s.ack_sent() < hwm {
+            err.push("a received shutdown has not been acknowledged");
+        }
+        let limit = hwm + u64::from(s.window());
+        let adv = s.advertised_limit();
+        if limit > adv && limit - adv >= c.window_update_threshold as u64 {
+            err.push("a window update is due");
+        }
+        if hwm > s.ack_sent() && hwm - s.ack_sent() >= c.ack_threshold as u64 {
+            err.push("an acknowledgement is due (ack threshold)");
+        }
+        if !err.is_empty() {
+            self.fail(format!(
+                "{} produced no frame, but {}",
+                NAME[x],
+                err.join("; ")
+            ));
         }
     }
 
@@ -1627,13 +1744,44 @@ impl World {
             } else if e.app.received as u64 != s.delivered() {
                 err.push("application received != delivered".into());
             }
+            if s.is_finished()
+                && !(s.shutdown_acked()
+                    && s.peer_shutdown().is_some()
+                    && s.recv_buffered() == 0
+                    && s.ack_sent() == s.recv_high_water_mark()
+                    && s.has_channel())
+            {
+                err.push("is_finished() although its documented conditions do not hold".into());
+            }
+            // `transport_timed_out()` is cleared by a swap, or once traffic
+            // means its condition no longer holds.
+            let to = s.config().timeout.as_micros() as Tick;
+            if e.status.driven()
+                && s.transport_timed_out()
+                && self.now < e.last_rx + to
+                && !(s.tx_pending() > 0 && self.now >= e.last_tx + to)
+            {
+                err.push(
+                    "transport_timed_out() is still set although its condition no longer holds"
+                        .into(),
+                );
+            }
             if s.app_eof() && !(r.send_closed() && s.delivered() == r.send_data_end()) {
                 err.push("app_eof before the whole peer stream was delivered".into());
             }
             if !err.is_empty() {
                 self.fail(format!("{}: {}", NAME[x], err.join("; ")));
             }
-            self.ends[x].mon = Mono {
+            let unacked = s.recv_high_water_mark() > s.ack_sent();
+            let now = self.now;
+            let e = &mut self.ends[x];
+            e.unacked_since = if unacked {
+                e.unacked_since.or(Some(now))
+            } else {
+                None
+            };
+            let s = &e.s;
+            e.mon = Mono {
                 send_limit: s.send_limit(),
                 peer_ack: s.peer_ack(),
                 max_sent: s.max_sent(),
