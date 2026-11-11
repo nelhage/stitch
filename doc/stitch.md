@@ -32,6 +32,8 @@ The server's reply in the setup handshake (see "Tunnel setup", below) contains t
 ## Proxying data
 The proxies communicate over the `ssh` channel. They speak a minimal "transport" protocol, which encapsulates data and acknowledges received data. Each proxy retains a buffer of sent-but-unacknowledged data for use during a resumption. The buffer is sized larger than a typical TCP send buffer to absorb flow during an extended offline window, but is fixed-size; if the buffer fills up, the proxy stops reading from the corresponding fd and relies on the underlying transport to eventually backpressure the sender.
 
+Each proxy also holds a bounded buffer of data it has received but not yet delivered to its local application, and advertises the free space in that buffer to its peer, which never sends beyond it (see "Flow control", below). As a result, a proxy never stops reading from the transport, even if its local application has stopped reading.
+
 The proxy data plane is completely symmetric between both ends; during steady state, absent any disconnections, the client and server behave completely symmetrically. Resumption is also parallel once a new transport channel has been established, although the process of negotiating and commencing a resumption (next section) is asymmetric.
 
 ## Resumption
@@ -51,6 +53,7 @@ The protocol core does not see the JSON handshake, and has no notion of "resume"
 On a channel swap, each end behaves identically:
 - It drops the old channel, discarding any partially-read frame.
 - It rewinds its send position to its first unacknowledged offset: all sent-but-unacknowledged data moves back to the head of the pending-send buffer. The swap itself does not write anything; it only updates buffers and offsets, and the normal send path then delivers the data on the new channel like any other pending data. In particular, this means the re-send is subject to the usual backpressure mechanism. Any data written to the old channel which the peer did not receive is, by construction, unacknowledged, and so is covered by this.
+- It immediately sends a frame on the new channel, even if it has no data to send (in which case the frame is zero-length, like a heartbeat). This gives the peer an up-to-date acknowledgement and receive window (see "Flow control") without waiting for the next heartbeat.
 - It sets a "first frame on this channel" flag on the first frame it sends, and expects that flag on the first frame it receives. The flag is set on the first frame of **every** channel, in both directions, including the initial one, and never on any later frame. It is not strictly necessary, but serves as a consistency check for the core that the peer agrees a new channel has started.
 
 Following a swap, each end may receive data it has already seen, either because its acknowledgements were not fully received on the old channel, or because it received the data over the old channel while the resume was in progress. The receiver is therefore briefly in a "catching up" state. This state is not tracked separately; it is determined entirely by comparing offsets:
@@ -77,6 +80,47 @@ In order to support the "timeout" condition, the proxies will continually send h
 
 Heartbeat duration and timeout are configurable, but will probably default to something like "heartbeat every 10s, timeout after 20 seconds."
 
+## Flow control
+Acknowledgements and heartbeats travel in-band, on the same channel as data. If a proxy ever stopped reading from the transport -- say, because its local application had stopped reading and it had nowhere to put incoming data -- it would also stop processing acknowledgements and heartbeats. The peer would see a dead transport and resume, the new channel would stall in the same way, and data in the opposite direction would be blocked as well.
+
+We avoid this with a receive window, which maintains the invariant that **a proxy never stops reading from the transport**: the peer is never permitted to send more data than the proxy has room to buffer.
+
+### The receive window
+Each proxy has a **receive buffer** of fixed capacity, holding data which it has received from the transport but which its local application has not yet accepted.
+
+Every frame carries, alongside its acknowledgement, a **window**: the number of bytes currently free in the sender's receive buffer. Together these define the peer's **send limit**, `ack + window`: the peer may send data bytes only at stream offsets below it. Since the acknowledgement covers everything the proxy has received, and the window is the free space in its buffer, the limit is always equal to "offset delivered to the application, plus buffer capacity", and so never decreases.
+
+An acknowledgement continues to mean "received by the proxy", not "delivered to the application." This allows the sender to release data from its retransmit buffer as soon as the peer holds it.
+
+There is no dedicated window-update frame. Any frame updates the window; a proxy with no data to send uses a zero-length frame, exactly as for a heartbeat.
+
+### Sender behavior
+- The send limit starts at zero, and is updated from each frame received. No data can be sent until the first frame arrives from the peer; each end sends a frame immediately on every new channel, so this costs at most half a round trip at startup.
+- Data is only ever sent below the send limit. Zero-length frames may always be sent, so acknowledgements, heartbeats, and window updates flow regardless of the window.
+- Data which cannot be sent because of the window waits in the send buffer, along with sent-but-unacknowledged data. When that buffer fills, the proxy stops reading from its local fd, as described in "Proxying data."
+- A frame which would decrease the send limit is a protocol error.
+
+### Receiver behavior
+- Received data is held in the receive buffer until the local application accepts it.
+- A frame containing data which does not fit in the receive buffer is a protocol error. The check is made against the buffer itself, which always has at least as much room as the proxy has advertised.
+- The proxy sends a window update once its limit has advanced by some threshold (a fraction of the buffer capacity, e.g. one quarter) beyond the limit it last advertised. Smaller advances are not announced on their own, to avoid trickling out tiny windows; they are carried by the next frame sent for any other reason, including the next heartbeat.
+
+The end-to-end backpressure path is therefore: an application stops reading; its proxy's receive buffer fills and the advertised window drops to zero; the peer stops sending data, and its send buffer fills; the peer stops reading from its own application, which eventually blocks on write. Throughout, frames continue to flow in both directions, and data in the opposite direction is unaffected.
+
+### Interaction with resumption
+- The send limit is a property of the stream, not of the channel, and survives a channel swap unchanged. The data which is rewound and re-sent after a swap lies entirely below the limit already granted, so it can be sent without waiting for a new advertisement.
+- Duplicate data discarded while "catching up" never enters the receive buffer, and so does not count against the window.
+- Within a channel, frames are delivered reliably and in order, so a window update can only be lost if the channel itself fails. In that case the first frame on the next channel, which each end sends immediately, carries the current acknowledgement and window. No periodic window probe is required.
+
+### Liveness
+With flow control in place, the traffic timeout measures the health of the transport alone: a peer whose application has stalled still reads frames and sends heartbeats. Conversely, since the peer is always reading, a proxy which finds itself unable to write to the transport for an extended period is experiencing a real transport stall, for which a resume is the correct response.
+
+### Sizing
+- The receive buffer capacity is local configuration. The two ends need not agree on it, and it is not negotiated; each end simply advertises what it has.
+- It is independent of the send buffer, which remains large in order to absorb data during an offline window.
+- The receive buffer bounds throughput to roughly "capacity / round-trip time", so it should default to a few MiB, comparable to `ssh`'s own channel window.
+- Frames have a modest maximum payload size (e.g. 64KiB), so that a fresh acknowledgement and window are never stuck behind a single very large frame.
+
 ## Tunnel setup
 
 When initiating or resuming a connection, it is necessary to exchange some out-of-band metadata, before shifting to the transport protocol.
@@ -95,7 +139,11 @@ We use an approach reminiscent of TCP FIN for shutdown.
 
 The transport layer has a "shutdown" flag, which can be set to indicate the shutdown of the sender. For the purpose of acknowledgements, the "shutdown" flag occupies a phantom byte position at the end of the byte stream -- the sender sends 1000 bytes and then shuts down, the receiver can ACK through bytes `1001` to acknowledge receipt of the shutdown.
 
-Each direction can be shutdown independently. Once either end has seen both a shutdown, and an acknowledgement of its own shutdown, it can terminate and close down entirely.
+The shutdown occupies a position in the stream, but no space in the peer's receive buffer, and so is not subject to the receive window: once all preceding data has been sent, the shutdown may be sent even if the window is zero.
+
+A proxy acknowledges a shutdown when it receives it, but does not shut down the corresponding local fd until all preceding data in its receive buffer has been delivered to the application.
+
+Each direction can be shutdown independently. Once either end has seen a shutdown, seen an acknowledgement of its own shutdown, and delivered the entire contents of its receive buffer to its local application, it can terminate and close down entirely.
 
 ### Crashed server
 If the client attempts to resume, and discovers that the rendezvous socket is missing or disconnnected, it will shut down. This is implemented by the "resume" shim on the remote side writing a JSON error reply (as in "Tunnel setup") to its stdout, which will be received by the client to trigger a shutdown. This behavior means that if the server ever shuts down, the client will eventually discover this fact and exit. Similar behavior applies if the server reboots or the server process crashes.
@@ -109,10 +157,13 @@ If the client attempts to resume, and discovers that the rendezvous socket is mi
     - Client initiates a connection to a newer or older server version
     - Server binary on-disk is upgraded, and server shim and a running server process are now different versions
     - Client connection lifetime is bound to the lifetime of a `stitch` process, so it's not possible for the client to change versions within the lifetime of a single connection.
-- Behavior when backpressuring
-    - As envisioned, the protocol sends keepalives and other metadata in-band. If one end of the connection is **alive** but has **stopped reading data**, we will not process packets and be unable to process keepalives. Is that okay? What exactly happens in that situation?
+- Local application closes its read side
+    - If the local application closes the fd we deliver data to, while the peer is still sending, the receive buffer can never drain, and the peer would stall forever at a zero window.
+    - The simplest answer is to discard incoming data from then on, while continuing to acknowledge it and advertise a full window. The alternative is an explicit "reset" signal which tells the peer to stop sending.
 
 ## Testing
 The whole machine should be written as a pure, IO-free core, allowing us to to test as much of the machinery as possible without invoking `ssh` or any external processes. We will set up a deterministic simulation testing harness for the core protocol machine, including fuzz testing/PBT.
+
+Flow control contributes several invariants for the harness to check: the receive buffer never exceeds its capacity; no data is ever sent beyond the send limit; and, with an application which never reads, heartbeats continue to flow in both directions and no resume is triggered.
 
 We will also implement an e2e test harness that runs `sshd` as an unprivileged user, but we will avoid using it for anything other than minimal smoke tests, or the occasional edge case where it's necessary to test the behavior of the actual UNIX interactions.
