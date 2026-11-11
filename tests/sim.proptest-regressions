@@ -1,0 +1,15 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cfa49e9298f2a49dfa43ac376453c28c8aa7fc30d2c3b45483f9a7fd9bb2a4ba # shrinks to seed = 1804332593140489159
+cc 0a7a3967c79511c3883b81defecbeb145eed602b40424a1ca4c18a4fea43e679 # shrinks to seed = 9080025270413165390, size = 67, chaos = 92
+cc c17239236f7180ad80d44cae3e6f0ec0ea1d8820ff0852dfad4b3b5d8820aec0 # shrinks to seed = 17939505732681408397, size = 72, chaos = 5
+cc 5295fb555204a600254198c41e3571f4fc6a43a54516d8520c2def896d3dfc69 # shrinks to seed = 714242226409642244, size = 11, chaos = 93
+cc 639c0d5483eea635c46bfdee2ed5dbd66c8489a58c29b8f3595196ab6ffcd2a1 # shrinks to seed = 6577885229538751741, size = 18, chaos = 52
+cc 79dbe49c7da51ecc8b6d0bb7d037e7afc1914969f96199f9378fd8778831afa6 # shrinks to seed = 175163290624065594
+cc 325a68dc768738e75f90cf43836fb61f23cc4ddad0a60b5b4f715e9b1eb23136 # shrinks to seed = 8046178177757151576, size = 19, chaos = 66
+cc 8ebf580c9eeba4b28bf78ccdf94b634cc2aef29c3f509b4b64f86786116acd45 # shrinks to seed = 8442188277920246824, size = 4, chaos = 59
+cc 3431cc6efce598e4968a50b518efd6628f5c4f92ddcf32d20e1ec230a3798470 # shrinks to seed = 14079891526667511025
