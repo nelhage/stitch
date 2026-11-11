@@ -323,6 +323,12 @@ impl Client {
     fn attempt_done(&mut self, r: AttemptResult) -> anyhow::Result<Option<i32>> {
         match r {
             Ok((child, channel)) => {
+                if let Err(e) = self.pump.install_channel(channel) {
+                    // Dropping `child` kills the new ssh.
+                    return self.attempt_done(Err(AttemptError::Failed(
+                        anyhow::Error::new(e).context("cannot use the new channel"),
+                    )));
+                }
                 log::info!("reconnected (epoch {})", self.epoch);
                 let mut old = std::mem::replace(
                     &mut self.active,
@@ -337,7 +343,6 @@ impl Client {
                         let _ = old.child.wait().await;
                     });
                 }
-                self.pump.install_channel(channel)?;
                 self.backoff = INITIAL_BACKOFF;
                 self.retry_at = None;
                 Ok(None)

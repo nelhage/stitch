@@ -503,7 +503,7 @@ impl Daemon {
                     }
                 },
                 Some(r) = pending.join_next(), if !pending.is_empty() => match r {
-                    Ok(Ok((conn, received))) => self.handle_resume(conn, received)?,
+                    Ok(Ok((conn, received))) => self.handle_resume(conn, received),
                     Ok(Err(e)) => log::warn!("bad connection on the rendezvous socket: {e:#}"),
                     Err(e) => log::warn!("receive task failed: {e}"),
                 },
@@ -549,23 +549,28 @@ impl Daemon {
         Ok(resume.epoch)
     }
 
-    fn handle_resume(&mut self, conn: UnixStream, received: Received) -> anyhow::Result<()> {
+    fn handle_resume(&mut self, conn: UnixStream, received: Received) {
         let [read, write] = <[OwnedFd; 2]>::try_from(received.fds).expect("two fds");
         let epoch = match self.check_resume(&received.json) {
             Ok(epoch) => epoch,
             Err((code, msg)) => {
                 tokio::spawn(reply_error(write, code, msg));
-                return Ok(());
+                return;
             }
         };
         log::info!("resuming on epoch {epoch}");
         self.epoch = epoch;
         let ok = Message::ok(self.id.as_str(), &self.socket).encode();
-        self.pump
-            .install_channel(Channel::new(read, write).with_preamble(ok))?;
+        if let Err(e) = self
+            .pump
+            .install_channel(Channel::new(read, write).with_preamble(ok))
+        {
+            // The client sees its attempt fail, and tries again.
+            log::warn!("cannot use the new channel: {e}");
+            return;
+        }
         // Replacing the previous connection closes it, which lets the
         // previous shim exit.
         self.conn = Some(conn);
-        Ok(())
     }
 }
