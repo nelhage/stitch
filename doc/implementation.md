@@ -24,23 +24,28 @@ A single crate with a library (`src/lib.rs`) and a thin binary (`src/main.rs`). 
 
 The session is symmetric; it has no notion of client or server, or of "resume". It is told about a new channel via `swap_channel`, which is also how the *initial* channel is installed.
 
-The interface, in outline (the implementation is authoritative):
+The interface (the implementation, `src/core/mod.rs`, is authoritative and documents every method):
 
 - Application side
   - `send_space()` / `write_app(&[u8]) -> usize`: accept bytes from the local application into the send buffer (bounded by `Config::send_buffer`).
   - `close_app_send()`: the local application has reached EOF; queue our `SHUTDOWN`.
-  - `app_data() -> &[u8]` / `consume_app(n)`: data received from the peer awaiting delivery to the local application.
+  - `app_data() -> &[u8]` / `consume_app(n)`: data received from the peer awaiting delivery to the local application (`app_data` may return only a prefix; it is non-empty whenever data is pending).
   - `app_eof() -> bool`: the peer's shutdown has been received and all preceding data delivered; the driver should close the local write side.
-  - `app_read_closed()`: the local application can no longer accept data (e.g. `EPIPE`). From then on, incoming data is discarded while still being acknowledged, and a full window is advertised (see "Local application closes its read side" in `stitch.md`).
+  - `close_app_read()`: the local application can no longer accept data (e.g. `EPIPE`). Pending data is discarded; from then on, incoming data is discarded while still being acknowledged, and a full window is advertised (see "Local application closes its read side" in `stitch.md`).
 - Transport side
-  - `swap_channel(now)`: drop the old channel (discarding any partial frame and any unwritten output), rewind to the first unacknowledged offset, and queue an immediate `FIRST` frame.
-  - `receive(&[u8], now) -> Result<(), ProtocolError>`: feed bytes read from the channel. Handles partial frames.
-  - `transmit_data() -> &[u8]` / `consume_transmit(n, now)`: encoded output for the channel. The session encodes frames into this buffer lazily, keeping it small (on the order of one frame), so that output not yet written can be cheaply discarded on a swap.
+  - `swap_channel(now)`: install a new channel (also the initial one): drop the old channel (discarding any partial frame and any unwritten output), rewind to the first unacknowledged offset, and queue an immediate `FIRST` frame. Timeouts restart from `now`.
+  - `receive(&[u8], now) -> Result<(), ProtocolError>`: feed bytes read from the channel. Handles partial frames. After a protocol error the session is dead: `receive` keeps returning the error, and nothing more is transmitted.
+  - `transmit_data(now) -> &[u8]` / `consume_transmit(n, now)`: encoded output for the channel. If nothing is pending and the frame-sending policy (below) calls for a frame, one frame is encoded first; output is thus produced lazily, one frame at a time, so that output not yet written can be cheaply discarded on a swap. The driver should check `transmit_data` after every event.
 - Time
-  - `poll_timeout() -> Option<Instant>`: when the driver should next call `handle_timeout`.
-  - `handle_timeout(now)`: send heartbeats/delayed acks; detect a dead or stalled transport.
-  - `transport_timed_out(now) -> bool` (or an event queue): no traffic has been received for `Config::timeout`, or pending output has made no progress for `Config::timeout`. Only the client acts on this.
-- `is_finished()`: both directions are shut down and acknowledged and the receive buffer is drained; the driver flushes any pending output and exits.
+  - `poll_timeout() -> Option<Instant>`: the earliest instant at which `handle_timeout` would do something (heartbeat or delayed ack due, or a timeout). Deadlines already acted on are not returned again, so a driver never spins; immediate work is not reflected here, but in `transmit_data`.
+  - `handle_timeout(now)`: queue a heartbeat/delayed ack if one is due and nothing is pending; detect a dead or stalled transport.
+  - `transport_timed_out() -> bool`: latched by `handle_timeout` when nothing has been received on the current channel for `Config::timeout`, or pending output has made no progress for `Config::timeout`; cleared by a swap, or once traffic means the condition no longer holds. Only the client acts on this.
+- `is_finished()`: our shutdown is acknowledged, the peer's is received and acknowledged in a frame on the current channel, and the receive buffer is drained; the driver flushes any pending output and exits.
+- Read-only introspection for tests and diagnostics: `send_limit()`, `send_position()`, `max_sent()`, `peer_ack()`, `send_buffered()`, `recv_high_water_mark()`, `recv_buffered()`, `recv_capacity()`, `window()`, `ack_sent()`, `advertised_limit()`, `peer_shutdown()`, `channel_resynced()`, `tx_pending()`, `frames_sent()`, `error()`, and others.
+
+After a channel swap, if the peer's first acknowledgement on the new channel covers data which has been rewound but not yet re-sent (because the peer received it on the old channel), the send position skips forward to that acknowledgement rather than re-sending data the peer already holds. Rule 3 of `framing.md` permits this, since the frame then starts exactly at the receiver's high-water mark.
+
+In addition to the rules in `framing.md`, a frame whose `SHUTDOWN` contradicts what has already been received (a shutdown before data already received, or at a different position from a shutdown already received) is a protocol error. For rule 6, "sent" means encoded into the transmit output, whether or not it was then written.
 
 ## Frame-sending policy
 
