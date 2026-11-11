@@ -703,6 +703,29 @@ exec {stitch} "$@"
 }
 
 #[test]
+fn hangup_finishes_the_session() {
+    // `ssh` closes its ProxyCommand's stdin and stdout and sends it SIGHUP
+    // as it exits. The tunnel must still deliver what it has read, and
+    // finish the session, rather than leave the server waiting for it.
+    let env = Env::new();
+    let (port, server) = echo_server();
+    let mut t = env.tunnel(&[&format!("127.0.0.1:{port}")]);
+    let mut stdin = t.stdin.take().unwrap();
+    let mut stdout = t.stdout.take().unwrap();
+    stdin.write_all(b"ping").unwrap();
+    assert_eq!(read_n(&mut stdout, 4), b"ping");
+    stdin.write_all(b"bye").unwrap();
+    drop(stdin);
+    drop(stdout);
+    signal(t.child.id() as i32, Signal::SIGHUP);
+    let status = t.wait();
+    assert!(status.success(), "{status}");
+    assert_eq!(server.join().unwrap(), 7);
+    assert!(client_log(&env).contains("hung up"));
+    env.assert_cleaned_up();
+}
+
+#[test]
 fn bad_resumes_are_rejected() {
     let env = Env::new();
     let mut t = env.tunnel(&["--", "cat"]);

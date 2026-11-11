@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use tokio::process::{Child, Command};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::Instant;
 
 use crate::core::Config;
@@ -32,6 +33,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// How long to wait for `ssh` to exit by itself once the session has
 /// finished, before killing it.
 const EXIT_WAIT: Duration = Duration::from_secs(3);
+
+/// How long we allow the session to finish after `SIGHUP`, before giving
+/// up on it.
+const HANGUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the channel may outlive the active `ssh` before we treat it as
 /// lost. An `ssh` normally exits only after writing everything it received
@@ -82,6 +87,10 @@ pub struct TunnelArgs {
 /// - On success, kills the old `ssh` and swaps the channel.
 /// - When the session finishes, flushes, closes the channel, waits briefly
 ///   for `ssh` to exit (killing it otherwise), and returns `Ok(0)`.
+/// - `SIGHUP` (which `ssh` sends its `ProxyCommand` as it exits) does not
+///   kill the process: the session carries on until it finishes (normally
+///   at once, since stdin and stdout have been closed too), for up to
+///   10 s.
 pub fn run_tunnel(args: TunnelArgs) -> anyhow::Result<i32> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -238,6 +247,10 @@ struct Client {
     /// need from it (see [`Client::all_received`]): there is no point in
     /// trying again, so we just finish delivering to the application.
     server_gone: bool,
+    /// `SIGHUP`, which `ssh` sends its `ProxyCommand` as it exits.
+    hangup: Signal,
+    /// After `SIGHUP`, when we give up on finishing the session.
+    hangup_deadline: Option<Instant>,
 }
 
 impl Client {
@@ -246,9 +259,15 @@ impl Client {
         // authenticating.
         let heartbeat_ms = u64::try_from(args.heartbeat_interval.as_millis()).unwrap_or(u64::MAX);
         let open = Message::open(heartbeat_ms, args.target.clone());
-        let (child, channel, reply) = handshake(&args, &open)
-            .await
-            .context("cannot open the session")?;
+        // `ssh` sends its ProxyCommand SIGHUP as it exits, typically just
+        // after closing our stdin and stdout. We then still need to finish
+        // the session (send what we have read, and our shutdown), so that
+        // the server does not wait for us forever.
+        let mut hangup = signal(SignalKind::hangup())?;
+        let (child, channel, reply) = tokio::select! {
+            r = handshake(&args, &open) => r.context("cannot open the session")?,
+            _ = hangup.recv() => bail!("hung up while opening the session"),
+        };
         let (session, socket) = match reply {
             Message::Ok(ok) => (ok.session, ok.socket),
             Message::Error(e) => bail!("cannot open the session: {}: {}", e.code, e.message),
@@ -274,6 +293,8 @@ impl Client {
             backoff: INITIAL_BACKOFF,
             retry_at: None,
             server_gone: false,
+            hangup,
+            hangup_deadline: None,
         };
         let result = client.main_loop().await;
         client.shutdown().await;
@@ -370,6 +391,13 @@ impl Client {
                     self.retry_at = None;
                 }
                 () = sleep_opt(grace_end) => {}
+                _ = self.hangup.recv(), if self.hangup_deadline.is_none() => {
+                    log::info!("hung up; finishing the session");
+                    self.hangup_deadline = Some(Instant::now() + HANGUP_TIMEOUT);
+                }
+                () = sleep_opt(self.hangup_deadline) => {
+                    bail!("hung up, and the session did not finish within {HANGUP_TIMEOUT:?}");
+                }
             }
         }
     }
