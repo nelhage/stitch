@@ -19,7 +19,7 @@ use tokio::process::{Child, Command};
 use tokio::time::Instant;
 
 use crate::core::Config;
-use crate::handshake::{self, ErrorReply, HandshakeError, Message, Target};
+use crate::handshake::{self, ErrorCode, ErrorReply, HandshakeError, Message, Target};
 use crate::runtime::{App, Channel, Event, Pump};
 
 /// Delay before retrying after the first failed resume attempt; it doubles
@@ -132,7 +132,8 @@ async fn handshake(args: &TunnelArgs, msg: &Message) -> anyhow::Result<(Child, C
 
 /// Why a resume attempt failed.
 enum AttemptError {
-    /// The server replied with an error: the session is gone.
+    /// The server replied with an error, or answered for a different
+    /// session: our session is gone.
     Rejected(ErrorReply),
     /// Anything else, such as `ssh` failing or the attempt timing out.
     Failed(anyhow::Error),
@@ -148,7 +149,7 @@ async fn resume_attempt(
     socket: PathBuf,
     epoch: u64,
 ) -> AttemptResult {
-    let msg = Message::resume(session, socket, epoch);
+    let msg = Message::resume(session.clone(), socket, epoch);
     let result = tokio::time::timeout(args.connect_timeout, handshake(&args, &msg)).await;
     match result {
         Err(_) => Err(AttemptError::Failed(anyhow!(
@@ -157,7 +158,14 @@ async fn resume_attempt(
         ))),
         Ok(Err(e)) => Err(AttemptError::Failed(e)),
         Ok(Ok((child, channel, reply))) => match reply {
-            Message::Ok(_) => Ok((child, channel)),
+            Message::Ok(ok) if ok.session == session => Ok((child, channel)),
+            // Whatever answered at our socket is not our session, and
+            // trying again would only reach it again.
+            Message::Ok(ok) => Err(AttemptError::Rejected(ErrorReply {
+                version: ok.version,
+                code: ErrorCode::NoSession,
+                message: format!("the server answered for session {}", ok.session),
+            })),
             Message::Error(e) => Err(AttemptError::Rejected(e)),
             other => Err(AttemptError::Failed(anyhow!(
                 "unexpected reply from the server: {other:?}"

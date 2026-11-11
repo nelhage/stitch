@@ -97,13 +97,14 @@ impl Env {
         self.tunnel_with(args, |_| {})
     }
 
+    /// Starts `stitch tunnel` with `args`, after `f` has adjusted the
+    /// command (e.g. to set `STITCH_REMOTE`, the remote `stitch` command).
     fn tunnel_with(&self, args: &[&str], f: impl FnOnce(&mut Command)) -> Tunnel {
         let mut cmd = self.command();
         cmd.arg("tunnel")
             .arg("--ssh")
             .arg(fake_ssh())
-            .arg("--remote-stitch")
-            .arg(STITCH)
+            .env("STITCH_REMOTE", STITCH)
             .arg("host")
             .args(args)
             .stdin(Stdio::piped())
@@ -662,6 +663,43 @@ fn expect_error(reply: Message, code: ErrorCode) {
         Message::Error(e) => assert_eq!(e.code, code, "{e:?}"),
         other => panic!("expected {code} error, got {other:?}"),
     }
+}
+
+#[test]
+fn resume_answered_for_another_session() {
+    // Whatever answers a resume must be our session; otherwise the session
+    // is as good as gone.
+    let env = Env::new();
+    let remote = env.path("remote");
+    let script = format!(
+        r#"#!/bin/sh
+# The first time, the real stitch; then a server for another session.
+if [ -e "{dir}/opened" ]; then
+    msg='{{"type":"ok","version":1,"session":"0123456789abcdef0123456789abcdef","socket":"/nonexistent"}}'
+    printf '%08x%s' ${{#msg}} "$msg"
+    exec sleep 30
+fi
+touch "{dir}/opened"
+exec {stitch} "$@"
+"#,
+        dir = env.dir.path().display(),
+        stitch = STITCH,
+    );
+    fs::write(&remote, script).unwrap();
+    fs::set_permissions(&remote, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut t = env.tunnel_with(&["--", "cat"], |cmd| {
+        cmd.env("STITCH_REMOTE", &remote);
+    });
+    let mut stdin = t.stdin.take().unwrap();
+    let mut stdout = t.stdout.take().unwrap();
+    stdin.write_all(b"ping").unwrap();
+    assert_eq!(read_n(&mut stdout, 4), b"ping");
+    env.break_connection(&env.invocation(0));
+    let status = t.wait();
+    assert!(!status.success(), "{status}");
+    let log = client_log(&env);
+    assert!(log.contains("remote session is gone"), "{log}");
+    assert!(log.contains("answered for session"), "{log}");
 }
 
 #[test]
