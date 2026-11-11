@@ -44,10 +44,17 @@ pub const CONF_FILE_NAME: &str = "stitch.conf";
 /// The line `stitch ssh-config` ensures is at the top of `~/.ssh/config`.
 pub const INCLUDE_LINE: &str = "Include stitch.conf";
 
-/// Options which make an `ssh` running over a stitch tunnel tolerate stalls:
-/// it never sees network failures, only pauses, which must not kill it.
-const STALL_TOLERANT_OPTIONS: [(&str, &str); 2] =
-    [("ServerAliveInterval", "0"), ("TCPKeepAlive", "no")];
+/// Options for an `ssh` running over a stitch tunnel.
+///
+/// - `ControlPath none`: never piggyback on an existing connection-sharing
+///   master (which would bypass the tunnel entirely), nor become one.
+/// - `ServerAliveInterval 0`, `TCPKeepAlive no`: it never sees network
+///   failures, only pauses, which must not kill it.
+const INNER_SSH_OPTIONS: [(&str, &str); 3] = [
+    ("ControlPath", "none"),
+    ("ServerAliveInterval", "0"),
+    ("TCPKeepAlive", "no"),
+];
 
 /// Quote `s` for a POSIX shell, leaving it bare if it is obviously safe.
 pub fn shell_quote(s: &str) -> String {
@@ -74,13 +81,13 @@ pub fn proxy_command(exe: &Path, args: &str) -> anyhow::Result<String> {
 
 /// The arguments (excluding `argv[0]`) with which `stitch ssh HOST args...`
 /// runs `ssh`:
-/// `-o ProxyCommand=<exe> tunnel %h -o ServerAliveInterval=0 -o TCPKeepAlive=no HOST args...`
+/// `-o ProxyCommand=<exe> tunnel %h -o ControlPath=none -o ServerAliveInterval=0 -o TCPKeepAlive=no HOST args...`
 pub fn ssh_args(exe: &Path, host: &OsStr, args: &[OsString]) -> anyhow::Result<Vec<OsString>> {
     let mut out: Vec<OsString> = vec![
         "-o".into(),
         format!("ProxyCommand={}", proxy_command(exe, "tunnel %h")?).into(),
     ];
-    for (k, v) in STALL_TOLERANT_OPTIONS {
+    for (k, v) in INNER_SSH_OPTIONS {
         out.push("-o".into());
         out.push(format!("{k}={v}").into());
     }
@@ -115,7 +122,7 @@ pub fn config_snippet(exe: &Path) -> anyhow::Result<String> {
         "    ProxyCommand {}\n",
         proxy_command(exe, &format!("tunnel --strip-suffix {HOST_SUFFIX} %h"))?
     ));
-    for (k, v) in STALL_TOLERANT_OPTIONS {
+    for (k, v) in INNER_SSH_OPTIONS {
         s.push_str(&format!("    {k} {v}\n"));
     }
     Ok(s)
@@ -402,6 +409,8 @@ mod tests {
                 "-o",
                 "ProxyCommand=/bin/stitch tunnel %h",
                 "-o",
+                "ControlPath=none",
+                "-o",
                 "ServerAliveInterval=0",
                 "-o",
                 "TCPKeepAlive=no",
@@ -421,6 +430,7 @@ mod tests {
             s.contains("\n    ProxyCommand /opt/50%%/stitch tunnel --strip-suffix .stitch %h\n"),
             "{s}"
         );
+        assert!(s.contains("\n    ControlPath none\n"));
         assert!(s.contains("\n    ServerAliveInterval 0\n"));
         assert!(s.contains("\n    TCPKeepAlive no\n"));
 
