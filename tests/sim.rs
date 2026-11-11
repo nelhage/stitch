@@ -180,6 +180,7 @@ fn scenarios_cover_interesting_cases() {
         ("transport timeouts", total.timeouts),
         ("cuts", total.cuts),
         ("stalls", total.stalls),
+        ("outages", total.outages),
         ("partial writes", total.partial_writes),
         ("sessions finishing", total.both_finished),
     ];

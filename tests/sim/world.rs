@@ -193,6 +193,7 @@ pub struct Stats {
     pub timeouts_peer_running: u64,
     pub cuts: u64,
     pub stalls: u64,
+    pub outages: u64,
     pub partial_writes: u64,
     pub frames: u64,
     pub orphans: u64,
@@ -217,6 +218,7 @@ impl Stats {
         self.timeouts_peer_running += o.timeouts_peer_running;
         self.cuts += o.cuts;
         self.stalls += o.stalls;
+        self.outages += o.outages;
         self.partial_writes += o.partial_writes;
         self.frames += o.frames;
         self.orphans += o.orphans;
@@ -239,6 +241,8 @@ pub struct World {
     srv_highest: Option<u64>,
     agenda: Vec<(Tick, Ev)>,
     healed: bool,
+    /// During an outage, every resume attempt fails.
+    outage_until: Tick,
     complete_at: Option<Tick>,
     snapshot: Option<[u64; 2]>,
     trace: VecDeque<String>,
@@ -321,6 +325,7 @@ impl World {
             srv_highest: None,
             agenda,
             healed: p.family == Family::Liveness,
+            outage_until: 0,
             complete_at: None,
             snapshot: None,
             trace: VecDeque::new(),
@@ -642,6 +647,7 @@ impl World {
             Ev::Heal => {
                 self.log("network heals".into());
                 self.healed = true;
+                self.outage_until = 0;
                 for ch in &mut self.chans {
                     for p in &mut ch.pipes {
                         p.stalled = false;
@@ -708,6 +714,31 @@ impl World {
                             }
                             if let Some(d) = dur {
                                 self.agenda.push((now + d, Ev::Unstall { ch: ci, dirs }));
+                            }
+                        }
+                    }
+                    Fault::Outage { dur, cut } => {
+                        self.log(format!("fault: outage for {} (cut={cut})", fmt_t(dur)));
+                        self.stats.outages += 1;
+                        self.outage_until = now + dur;
+                        // (Not the initial open, which the client does not retry.)
+                        let attempt = self
+                            .cli
+                            .attempt
+                            .as_ref()
+                            .filter(|a| a.epoch > 0)
+                            .map(|a| a.ch);
+                        for ci in active.into_iter().chain(attempt) {
+                            if cut {
+                                self.cut_channel(ci);
+                            } else {
+                                let ch = &mut self.chans[ci];
+                                ch.disturbed = true;
+                                for p in &mut ch.pipes {
+                                    p.stalled = true;
+                                }
+                                let dirs = [true, true];
+                                self.agenda.push((now + dur, Ev::Unstall { ch: ci, dirs }));
                             }
                         }
                     }
@@ -1002,8 +1033,13 @@ impl World {
             now + ctl.connect_timeout
         };
         let mut doom = "";
-        if !initial && !self.healed && self.rng.below(1000) < ctl.doom_permille {
-            match self.rng.below(4) {
+        let outage = now < self.outage_until;
+        if !initial && !self.healed && (outage || self.rng.below(1000) < ctl.doom_permille) {
+            match if outage {
+                self.rng.below(2)
+            } else {
+                self.rng.below(4)
+            } {
                 0 => {
                     doom = "slow to establish";
                     establish = ctl.connect_timeout + self.rng.range(1, 10 * SEC);

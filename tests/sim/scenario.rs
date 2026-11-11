@@ -134,6 +134,10 @@ pub enum Fault {
     Stall { dirs: [bool; 2], dur: Option<Tick> },
     /// The client starts a resume although nothing is wrong.
     Speculative,
+    /// Everything stops for `dur` (a suspended laptop, a network outage):
+    /// the active channel stalls (or is cut), and every resume attempt
+    /// fails until it ends.
+    Outage { dur: Tick, cut: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -193,10 +197,13 @@ fn gen_config(r: &mut Rng, heartbeat: Tick, timeout: Tick, live: bool, aggressiv
     } else {
         r.usize_log(64, stitch::frame::MAX_PAYLOAD)
     };
-    let window_update_threshold = match r.below(3) {
-        0 => recv_buffer / 4,
-        1 => r.usize_range(0, recv_buffer),
-        _ => 0,
+    let window_update_threshold = match r.below(10) {
+        0..3 => recv_buffer / 4,
+        3..6 => r.usize_range(0, recv_buffer),
+        6..9 => 0,
+        // Never announce a window on its own: updates ride on heartbeats
+        // and acknowledgements only.
+        _ => recv_buffer + r.usize_range(1, 1000),
     };
     Config {
         send_buffer,
@@ -239,7 +246,7 @@ impl Params {
         } else {
             0
         };
-        let heal_at = match family {
+        let mut heal_at = match family {
             Clean => r.range(10 * SEC, 120 * SEC),
             Chaos => r.range(20 * SEC, 20 * SEC + chaos * 4 * SEC),
             Liveness => 0,
@@ -270,9 +277,13 @@ impl Params {
                 .min(cfg[y].recv_buffer)
                 .min(cfg[x].send_buffer)
                 .max(1);
-            let bound = (unit * if live { 300 } else { 1500 })
+            let mut bound = (unit * if live { 300 } else { 1500 })
                 .min(write_chunk_max * 400)
                 .min(rates[y].2 * 400);
+            if cfg[y].window_update_threshold > cfg[y].recv_buffer {
+                // About one window per heartbeat.
+                bound = bound.min(cfg[y].recv_buffer * 20);
+            }
             let stream_len = if live && never_reader == Some(y) {
                 // Enough to fill the never-reading peer's receive buffer and
                 // our own send buffer, so our writer ends up blocked.
@@ -380,6 +391,14 @@ impl Params {
                                 _ => None,
                             },
                         },
+                        70..75 => {
+                            let dur = r.log_range(timeout, 120 * MIN);
+                            heal_at = heal_at.max(at + dur);
+                            Fault::Outage {
+                                dur,
+                                cut: r.chance(1, 2),
+                            }
+                        }
                         _ => Fault::Speculative,
                     };
                     faults.push((at, f));
