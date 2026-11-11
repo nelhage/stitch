@@ -75,7 +75,7 @@ The client triggers a resumption:
 
 In order to support the "timeout" condition, the proxies will continually send heartbeat packets even if there's no traffic at the application layer. Heartbeat packets are just normal "data" packets with a zero-length data segment.
 
-Heartbeat duration and timeout are configurable, but will probably default to something like "heartbeat every 30s, timeout after 60 seconds."
+Heartbeat duration and timeout are configurable, but will probably default to something like "heartbeat every 10s, timeout after 20 seconds."
 
 ## Tunnel setup
 
