@@ -68,7 +68,9 @@ A frame is sent when any of the following holds:
 
 # Setup handshake (`handshake`)
 
-Messages are framed as an 8-digit hexadecimal length (ASCII, case-insensitive on read, lowercase on write) followed by that many bytes of JSON. Messages larger than 1 MiB are rejected. Unknown JSON fields are ignored, for forwards compatibility. Every message carries `"version": 1`.
+Messages are framed as an 8-digit hexadecimal length (ASCII, case-insensitive on read, lowercase on write) followed by that many bytes of JSON. Messages larger than 1 MiB are rejected. Unknown JSON fields are ignored, for forwards compatibility. Every message carries `"version": 1`; the field is required, but its value is left to the receiver to judge.
+
+The readers read exactly the 8-byte prefix and then exactly the body, and so never consume any of the frame data which follows; they must not be given a buffering reader. They return the raw JSON alongside the parsed message, so that the shim can forward it verbatim. EOF before the first byte is reported distinctly from EOF part-way through a message.
 
 Client → server:
 
@@ -94,21 +96,25 @@ Server → client:
 {"type":"error","version":1,"code":"no_session","message":"..."}
 ```
 
-Error codes: `no_session` (rendezvous socket missing or refusing connections), `stale_epoch`, `bad_request`, `target_failed`, `internal`. The client treats an `error` reply to a resume as fatal (see "Crashed server").
+Error codes: `no_session` (rendezvous socket missing or refusing connections), `stale_epoch`, `bad_request`, `target_failed`, `internal`. An unrecognised code (from a newer peer) is preserved rather than failing to parse. The client treats an `error` reply to a resume as fatal (see "Crashed server").
+
+# Destinations (`target`)
+
+`[<DEST>:]<PORT>`: a bare port means `localhost`. IPv6 literals must be bracketed (`[::1]:22`), since otherwise the port would be ambiguous; the brackets are removed before the host is sent in the `open`. Ports must be 1–65535.
 
 # Server side (`server`)
 
-Rendezvous directory: `$XDG_RUNTIME_DIR/stitch`, falling back to `/tmp/stitch-<uid>`; created with mode `0700` (and its ownership and mode verified if it already exists). Per session, with a random 128-bit hex id: `<dir>/<id>.sock` and `<dir>/<id>.log`.
+Rendezvous directory: `$XDG_RUNTIME_DIR/stitch` (if that is set to an absolute path), falling back to `/tmp/stitch-<uid>`; created with mode `0700`. If it already exists it must be a directory (not a symlink) owned by our effective uid, or we refuse to use it; a group- or world-accessible mode is reset to `0700`. Per session, with a random 128-bit id written as 32 lowercase hex digits: `<dir>/<id>.sock` and `<dir>/<id>.log`. Session ids received from elsewhere are validated as lowercase hex, so they are always safe as file names.
 
 `stitch _server-shim` (invoked by `ssh` as the remote command):
 
 1. Reads one handshake message from stdin.
 2. `open`: generates a session id, binds the listening socket, and spawns the daemon (`<current_exe> _server`) with the listening socket inherited as an fd, in a new session (`setsid`), with stdin from `/dev/null` and stdout/stderr appended to the log. It then proceeds exactly as for a resume, against the new socket.
 3. `resume`: connects to the socket named in the message. If that fails, writes an `error` (`no_session`) reply to stdout and exits.
-4. Forwards the raw message bytes (unparsed beyond what it needed, so that a newer daemon can see fields the shim does not know about), with its stdin and stdout attached as `SCM_RIGHTS`, in a single `sendmsg`.
+4. Forwards the raw message bytes (unparsed beyond what it needed, so that a newer daemon can see fields the shim does not know about), with its stdin and stdout attached as `SCM_RIGHTS`, in a single `sendmsg`. (`fdpass` sends the length-prefixed message; the fds ride on that `sendmsg`, and any remainder it did not accept follows in plain writes.)
 5. Closes its own copies of stdin and stdout, then blocks reading the Unix connection until EOF, then exits. The daemon holds the connection open for as long as it is using that channel.
 
-`stitch _server` (the per-session daemon): accepts connections on the rendezvous socket; each delivers one message and two fds.
+`stitch _server` (the per-session daemon): accepts connections on the rendezvous socket; each delivers one message and two fds. The daemon receives them with `fdpass`'s async receiver, which works on a `tokio::net::UnixStream` through its readiness API, reads exactly one message, requires exactly the expected fds, and receives them close-on-exec. It applies no timeout of its own, so the daemon should wrap it in one.
 
 - The first must be an `open`. The daemon connects to the target (TCP, or spawns the command), replies `ok` on the passed stdout fd (or `error`, then exits), and installs the channel.
 - Thereafter, only `resume`s with an epoch strictly greater than the highest accepted are allowed; others get an `error` written to their fds, which are then closed. On acceptance it writes `ok`, swaps the channel, and closes the previous channel's fds and Unix connection (which lets the previous shim exit).
@@ -126,9 +132,14 @@ Rendezvous directory: `$XDG_RUNTIME_DIR/stitch`, falling back to `/tmp/stitch-<u
 - On success, the old `ssh` is killed, the new channel installed, and `swap_channel` called.
 - When the session finishes, the client flushes, closes the channel, waits briefly for `ssh` to exit (killing it otherwise), and exits 0.
 
-`stitch ssh HOST [args...]` execs `ssh -o ProxyCommand='<stitch> tunnel %h' -o ServerAliveInterval=0 -o TCPKeepAlive=no HOST args...` (the inner ssh never sees network failures except as a stall, which must not kill it).
+`stitch ssh HOST [args...]` execs `ssh -o ProxyCommand='<stitch> tunnel %h' -o ServerAliveInterval=0 -o TCPKeepAlive=no HOST args...` (the inner ssh never sees network failures except as a stall, which must not kill it). `<stitch>` is the absolute path of the running binary, shell-quoted (`ssh` runs the `ProxyCommand` with the user's shell) and with any `%` doubled (`ssh` expands `%` tokens). `args` are passed through verbatim, including a `--` directly after `HOST`.
 
-`stitch ssh-config` writes `~/.ssh/stitch.conf` containing a `Host *.stitch` block whose `ProxyCommand` runs `stitch tunnel --strip-suffix .stitch %h`, and ensures `Include stitch.conf` is at the top of `~/.ssh/config`. `--print` prints the snippet instead.
+`stitch ssh-config` writes `~/.ssh/stitch.conf` containing a `Host *.stitch` block whose `ProxyCommand` runs `<stitch> tunnel --strip-suffix .stitch %h` (with `<stitch>` as for `stitch ssh`), and which also sets `ServerAliveInterval 0` and `TCPKeepAlive no`, as `stitch ssh` does. It ensures `Include stitch.conf` is at the top of `~/.ssh/config`:
+
+- `~/.ssh` (mode `0700`) and the files (mode `0600`) are created if necessary; existing content and modes are preserved, files are replaced atomically, and a symlinked `~/.ssh/config` is updated through the link.
+- If `~/.ssh/config` already has an `Include` of `stitch.conf` (or `~/.ssh/stitch.conf`, or its absolute path) before any `Host` or `Match` line, nothing changes. If it has one only inside a `Host` or `Match` block, nothing changes either (to avoid a duplicate), but a warning is printed.
+
+`--print` prints the snippet instead.
 
 # Testing
 
