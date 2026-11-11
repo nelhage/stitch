@@ -98,13 +98,13 @@ impl Env {
     }
 
     /// Starts `stitch tunnel` with `args`, after `f` has adjusted the
-    /// command (e.g. to set `STITCH_REMOTE`, the remote `stitch` command).
+    /// command (e.g. to set `STITCH_BINARY`, the remote `stitch` command).
     fn tunnel_with(&self, args: &[&str], f: impl FnOnce(&mut Command)) -> Tunnel {
         let mut cmd = self.command();
         cmd.arg("tunnel")
             .arg("--ssh")
             .arg(fake_ssh())
-            .env("STITCH_REMOTE", STITCH)
+            .env("STITCH_BINARY", STITCH)
             .arg("host")
             .args(args)
             .stdin(Stdio::piped())
@@ -688,7 +688,7 @@ exec {stitch} "$@"
     fs::write(&remote, script).unwrap();
     fs::set_permissions(&remote, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let mut t = env.tunnel_with(&["--", "cat"], |cmd| {
-        cmd.env("STITCH_REMOTE", &remote);
+        cmd.env("STITCH_BINARY", &remote);
     });
     let mut stdin = t.stdin.take().unwrap();
     let mut stdout = t.stdout.take().unwrap();

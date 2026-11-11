@@ -76,14 +76,16 @@ pub struct TunnelOpts {
     #[arg(short = 'o', long = "ssh-option", value_name = "OPT")]
     pub ssh_options: Vec<String>,
 
-    /// The stitch command to run on HOST (interpreted by the remote shell)
+    /// Location of the stitch binary on HOST, instead of looking it up on the
+    /// remote PATH. It is interpreted by the remote shell, so e.g.
+    /// `~/bin/stitch` works.
     #[arg(
         long,
-        env = "STITCH_REMOTE",
+        env = "STITCH_BINARY",
         default_value = "stitch",
-        value_name = "CMD"
+        value_name = "PATH"
     )]
-    pub remote_stitch: String,
+    pub stitch_binary: String,
 
     /// Seconds between heartbeats
     #[arg(long, value_name = "SECS", default_value = "10", value_parser = parse_secs)]
@@ -178,7 +180,7 @@ impl TunnelOpts {
             target,
             ssh: self.ssh,
             ssh_options: self.ssh_options,
-            remote_stitch: self.remote_stitch,
+            stitch_binary: self.stitch_binary,
             heartbeat_interval: self.heartbeat_interval,
             timeout: self.timeout,
             connect_timeout: self.connect_timeout,
@@ -338,7 +340,7 @@ mod tests {
     #[test]
     fn tunnel_defaults() {
         // The defaults can be overridden from the environment; skip if so.
-        if std::env::var_os("STITCH_SSH").is_some() || std::env::var_os("STITCH_REMOTE").is_some() {
+        if std::env::var_os("STITCH_SSH").is_some() || std::env::var_os("STITCH_BINARY").is_some() {
             return;
         }
         let t = tunnel(&["tunnel", "host"]).unwrap();
@@ -349,7 +351,7 @@ mod tests {
                 target: tcp("localhost", None),
                 ssh: "ssh".into(),
                 ssh_options: vec![],
-                remote_stitch: "stitch".into(),
+                stitch_binary: "stitch".into(),
                 heartbeat_interval: Duration::from_secs(10),
                 timeout: Duration::from_secs(20),
                 connect_timeout: Duration::from_secs(30),
@@ -398,7 +400,7 @@ mod tests {
             "Port=2222",
             "--ssh-option",
             "User=me",
-            "--remote-stitch",
+            "--stitch-binary",
             "/opt/stitch",
             "--heartbeat-interval",
             "0.25",
@@ -414,7 +416,7 @@ mod tests {
         assert_eq!(t.host, "box");
         assert_eq!(t.ssh, "/bin/fake-ssh");
         assert_eq!(t.ssh_options, ["Port=2222", "User=me"]);
-        assert_eq!(t.remote_stitch, "/opt/stitch");
+        assert_eq!(t.stitch_binary, "/opt/stitch");
         assert_eq!(t.heartbeat_interval, Duration::from_millis(250));
         assert_eq!(t.timeout, Duration::from_millis(1500));
         assert_eq!(t.connect_timeout, Duration::from_secs(3));

@@ -208,7 +208,7 @@ impl Sshd {
     /// The remote `stitch` command: the built binary, with its rendezvous
     /// directory here. `ssh` passes no environment by default, so it is set
     /// in the command, which the remote shell interprets.
-    fn remote_stitch(&self) -> String {
+    fn stitch_binary(&self) -> String {
         format!(
             "env XDG_RUNTIME_DIR={} STITCH_LOG=debug {STITCH}",
             self.dir.path().display()
@@ -224,8 +224,8 @@ impl Sshd {
             .arg("tunnel")
             .arg("--ssh")
             .arg(&self.ssh)
-            .arg("--remote-stitch")
-            .arg(self.remote_stitch())
+            .arg("--stitch-binary")
+            .arg(self.stitch_binary())
             .arg("testhost")
             .args(args)
             .stderr(fs::File::create(self.path("client.err")).unwrap());
@@ -430,9 +430,9 @@ fn ssh_through_stitch_proxy_command() {
     // primary use case.
     let Some(sshd) = Sshd::start() else { return };
     let proxy = format!(
-        "{STITCH} tunnel --ssh {} --remote-stitch '{}' %h",
+        "{STITCH} tunnel --ssh {} --stitch-binary '{}' %h",
         sshd.ssh.display(),
-        sshd.remote_stitch()
+        sshd.stitch_binary()
     );
     let out = Command::new(&sshd.ssh)
         .env("STITCH_LOG", "debug")

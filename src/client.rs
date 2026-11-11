@@ -55,9 +55,9 @@ pub struct TunnelArgs {
     pub ssh: OsString,
     /// Extra `ssh` options, each to be passed as `-o <OPT>`.
     pub ssh_options: Vec<String>,
-    /// The remote `stitch` command (`--remote-stitch` / `STITCH_REMOTE`). It is
+    /// The remote `stitch` command (`--stitch-binary` / `STITCH_BINARY`). It is
     /// placed on `ssh`'s command line, so the remote shell interprets it.
-    pub remote_stitch: String,
+    pub stitch_binary: String,
     /// How often each end sends a heartbeat; sent to the server as
     /// `heartbeat_ms`.
     pub heartbeat_interval: Duration,
@@ -71,7 +71,7 @@ pub struct TunnelArgs {
 /// return the process exit code.
 ///
 /// Contract (from `doc/implementation.md`, "Client side"):
-/// - Spawns `<ssh> [-o OPT]... -T <host> <remote_stitch> _server-shim`, using
+/// - Spawns `<ssh> [-o OPT]... -T <host> <stitch_binary> _server-shim`, using
 ///   the child's stdin/stdout as the channel and inheriting its stderr. Sends
 ///   an `open` (epoch 0) and waits, with no timeout of its own, for the reply;
 ///   if the open fails, returns an error (non-zero exit).
@@ -99,7 +99,7 @@ pub fn run_tunnel(args: TunnelArgs) -> anyhow::Result<i32> {
 }
 
 /// The arguments (excluding `argv[0]`) with which the client runs `ssh`:
-/// `-o ControlPath=none [-o OPT]... -T <host> <remote-stitch> _server-shim`.
+/// `-o ControlPath=none [-o OPT]... -T <host> <stitch-binary> _server-shim`.
 ///
 /// `ControlPath=none` comes first, so that it takes precedence over both the
 /// user's configuration and `--ssh-option`s: each connection must be a fresh
@@ -113,7 +113,7 @@ fn ssh_args(args: &TunnelArgs) -> Vec<OsString> {
     }
     out.push("-T".into());
     out.push(args.host.clone().into());
-    out.push(args.remote_stitch.clone().into());
+    out.push(args.stitch_binary.clone().into());
     out.push("_server-shim".into());
     out
 }
@@ -502,7 +502,7 @@ mod tests {
             },
             ssh: "ssh".into(),
             ssh_options: vec!["ControlPath=/tmp/master".into(), "Port=2222".into()],
-            remote_stitch: "stitch".into(),
+            stitch_binary: "stitch".into(),
             heartbeat_interval: Duration::from_secs(10),
             timeout: Duration::from_secs(20),
             connect_timeout: Duration::from_secs(30),
