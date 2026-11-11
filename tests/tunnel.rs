@@ -774,6 +774,17 @@ fn read_n(r: &mut impl Read, n: usize) -> Vec<u8> {
     buf
 }
 
+/// The relay of a fake ssh which carries data from the server to the
+/// client: the one writing to the same pipe as the ssh's own stdout.
+fn server_to_client_relay(inv: &Invocation) -> i32 {
+    let stdout = |pid: i32| fs::read_link(format!("/proc/{pid}/fd/1")).unwrap();
+    let ssh = stdout(inv.ssh);
+    *inv.relays
+        .iter()
+        .find(|&&p| stdout(p) == ssh)
+        .expect("a relay writing to ssh's stdout")
+}
+
 #[test]
 fn slow_reader_at_session_end() {
     // The server finishes while the client still holds data for a reader
@@ -825,6 +836,36 @@ fn channel_lost_at_session_end_while_delivering() {
     assert_eq!(got.len(), len);
     let status = t.wait();
     assert!(status.success(), "{status}");
+    env.assert_cleaned_up();
+}
+
+#[test]
+fn final_ack_lost_resume_during_linger() {
+    // The server's acknowledgement of the client's shutdown, the last thing
+    // the client needs, is lost: the server finishes, but the client cannot
+    // until it resumes and receives it on the new channel.
+    let env = Env::new();
+    let mut t = env.tunnel(&[
+        "--heartbeat-interval",
+        "0.1",
+        "--timeout",
+        "0.5",
+        "--",
+        "echo",
+        "hello",
+    ]);
+    let mut out = Vec::new();
+    t.stdout.take().unwrap().read_to_end(&mut out).unwrap();
+    assert_eq!(out, b"hello\n");
+    // The server's shutdown has been received, and its acknowledgement
+    // sent; from now on nothing reaches the client on this channel.
+    let first = env.invocation(0);
+    signal(server_to_client_relay(&first), Signal::SIGSTOP);
+    drop(t.stdin.take());
+    wait_for_server_log(&env, "session finished");
+    let status = t.wait();
+    assert!(status.success(), "{status}");
+    assert!(client_log(&env).contains("reconnected (epoch 1)"));
     env.assert_cleaned_up();
 }
 

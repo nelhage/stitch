@@ -38,6 +38,12 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the daemon allows for connecting to a TCP target.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the daemon lingers once its session has finished, unless the
+/// client closes the channel first. The client may not have received our
+/// final acknowledgement (it may be lost with the channel), and then needs to
+/// resume to get it: the stream equivalent of TCP's `TIME_WAIT`.
+const LINGER: Duration = Duration::from_secs(60);
+
 /// The server's transport timeout, as a multiple of the heartbeat interval.
 /// The server never acts on a timeout (only the client resumes), beyond
 /// logging it.
@@ -245,8 +251,11 @@ impl Drop for SocketGuard {
 ///   highest accepted are allowed; others get an `error` reply and their fds
 ///   closed. On acceptance: reply `ok`, swap the channel, and close the
 ///   previous channel's fds and Unix connection (letting the old shim exit).
-/// - Exits when the session finishes (or on a protocol error), removing its
-///   socket. Logs to stderr (the session log), controlled by `STITCH_LOG`.
+/// - Once the session finishes, lingers: it keeps serving the channel, and
+///   accepting resumes, until the client closes the channel or [`LINGER`]
+///   passes since the session finished (or since the last resume). Then it
+///   exits, removing its socket. Exits at once on a protocol error.
+/// - Logs to stderr (the session log), controlled by `STITCH_LOG`.
 pub fn run_daemon(listen_fd: RawFd) -> anyhow::Result<i32> {
     if listen_fd < 0
         || nix::fcntl::fcntl(
@@ -389,6 +398,14 @@ async fn wait_child(
     }
 }
 
+/// Sleeps until `at`, or forever if it is `None`.
+async fn sleep_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The session's configuration, given the client's `open`.
 fn session_config(open: &Open) -> Config {
     let heartbeat = match open.heartbeat_ms {
@@ -415,6 +432,8 @@ struct Daemon {
     epoch: u64,
     /// The command target's process, until it exits.
     child: Option<tokio::process::Child>,
+    /// Once the session has finished, when the daemon stops lingering.
+    linger_until: Option<tokio::time::Instant>,
 }
 
 impl Daemon {
@@ -468,6 +487,7 @@ impl Daemon {
             conn: Some(conn),
             epoch: 0,
             child: target.child,
+            linger_until: None,
         })
     }
 
@@ -477,8 +497,11 @@ impl Daemon {
             tokio::select! {
                 ev = self.pump.next_event() => match ev {
                     Event::Finished { flushed } => {
-                        log::info!("session finished{}", if flushed { "" } else { " (final output not flushed)" });
-                        return Ok(0);
+                        log::info!(
+                            "session finished{}; lingering for up to {LINGER:?} until the client disconnects",
+                            if flushed { "" } else { " (final output not flushed)" },
+                        );
+                        self.linger_until = Some(tokio::time::Instant::now() + LINGER);
                     }
                     Event::ProtocolError(e) => {
                         log::error!("protocol error: {e}");
@@ -490,6 +513,12 @@ impl Daemon {
                             Some(e) => log::info!("channel failed: {e}"),
                         }
                         self.conn = None;
+                        if self.linger_until.is_some() {
+                            // The client normally closes the channel once it
+                            // has finished.
+                            log::info!("exiting");
+                            return Ok(0);
+                        }
                     }
                     Event::TimedOut => log::info!("no traffic on the channel for {:?}", self.pump.session().config().timeout),
                 },
@@ -507,6 +536,10 @@ impl Daemon {
                     Ok(Err(e)) => log::warn!("bad connection on the rendezvous socket: {e:#}"),
                     Err(e) => log::warn!("receive task failed: {e}"),
                 },
+                () = sleep_opt(self.linger_until) => {
+                    log::info!("the client did not disconnect within {LINGER:?}; exiting");
+                    return Ok(0);
+                }
                 status = wait_child(&mut self.child) => {
                     match status {
                         Ok(s) => log::info!("command exited: {s}"),
@@ -572,5 +605,10 @@ impl Daemon {
         // Replacing the previous connection closes it, which lets the
         // previous shim exit.
         self.conn = Some(conn);
+        if self.linger_until.is_some() {
+            // The client missed the end of the session, and is now getting
+            // it on this channel.
+            self.linger_until = Some(tokio::time::Instant::now() + LINGER);
+        }
     }
 }
