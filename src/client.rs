@@ -98,18 +98,32 @@ pub fn run_tunnel(args: TunnelArgs) -> anyhow::Result<i32> {
     rt.block_on(Client::run(args))
 }
 
+/// The arguments (excluding `argv[0]`) with which the client runs `ssh`:
+/// `-o ControlPath=none [-o OPT]... -T <host> <remote-stitch> _server-shim`.
+///
+/// `ControlPath=none` comes first, so that it takes precedence over both the
+/// user's configuration and `--ssh-option`s: each connection must be a fresh
+/// one, never multiplexed over an existing master which may itself be stuck
+/// on a network path that no longer works.
+fn ssh_args(args: &TunnelArgs) -> Vec<OsString> {
+    let mut out: Vec<OsString> = vec!["-o".into(), "ControlPath=none".into()];
+    for opt in &args.ssh_options {
+        out.push("-o".into());
+        out.push(opt.into());
+    }
+    out.push("-T".into());
+    out.push(args.host.clone().into());
+    out.push(args.remote_stitch.clone().into());
+    out.push("_server-shim".into());
+    out
+}
+
 /// Runs `ssh` to the host, sends `msg` to the shim, and reads its reply.
 /// Returns the `ssh` process, the channel (its stdout and stdin), and the
 /// reply.
 async fn handshake(args: &TunnelArgs, msg: &Message) -> anyhow::Result<(Child, Channel, Message)> {
     let mut cmd = Command::new(&args.ssh);
-    for opt in &args.ssh_options {
-        cmd.arg("-o").arg(opt);
-    }
-    cmd.arg("-T")
-        .arg(&args.host)
-        .arg(&args.remote_stitch)
-        .arg("_server-shim")
+    cmd.args(ssh_args(args))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -471,5 +485,44 @@ impl Client {
             log::debug!("killing ssh");
             let _ = active.child.kill().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_never_shares_a_connection() {
+        let args = TunnelArgs {
+            host: "example.com".into(),
+            target: Target::Tcp {
+                host: "localhost".into(),
+                port: None,
+            },
+            ssh: "ssh".into(),
+            ssh_options: vec!["ControlPath=/tmp/master".into(), "Port=2222".into()],
+            remote_stitch: "stitch".into(),
+            heartbeat_interval: Duration::from_secs(10),
+            timeout: Duration::from_secs(20),
+            connect_timeout: Duration::from_secs(30),
+        };
+        // ssh uses the first value it sees for an option, so ours must come
+        // before the user's.
+        assert_eq!(
+            ssh_args(&args),
+            [
+                "-o",
+                "ControlPath=none",
+                "-o",
+                "ControlPath=/tmp/master",
+                "-o",
+                "Port=2222",
+                "-T",
+                "example.com",
+                "stitch",
+                "_server-shim",
+            ]
+        );
     }
 }
