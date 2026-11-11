@@ -18,7 +18,7 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
         in
-        {
+        rec {
           default = pkgs.mkShell {
             packages = [
               pkgs.cargo
@@ -28,6 +28,14 @@
               pkgs.rust-analyzer
             ];
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+          };
+          # The default shell, plus a pinned OpenSSH for the e2e tests
+          # (tests/e2e_sshd.rs). Kept separate so that the development shell
+          # doesn't shadow the user's own `ssh`.
+          ci = pkgs.mkShell {
+            inputsFrom = [ default ];
+            packages = [ pkgs.openssh ];
+            inherit (default) RUST_SRC_PATH;
           };
         }
       );
