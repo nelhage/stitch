@@ -17,7 +17,8 @@ use crate::{sshconfig, target};
     version,
     about = "Reliable, resumable streams over ssh",
     long_about = "Reliable, resumable streams over ssh.\n\n\
-        Logging is controlled by STITCH_LOG (e.g. STITCH_LOG=debug); the default is warn."
+        Logging is controlled by STITCH_LOG (e.g. STITCH_LOG=debug); the default is warn \
+        (info for the server daemon's log)."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -221,8 +222,13 @@ where
 
 /// Set up logging to stderr, filtered by `STITCH_LOG` (default `warn`).
 pub fn init_logging() {
+    init_logging_with_default(log::LevelFilter::Warn);
+}
+
+/// Set up logging to stderr, filtered by `STITCH_LOG` (default `default`).
+pub fn init_logging_with_default(default: log::LevelFilter) {
     let _ = env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Warn)
+        .filter_level(default)
         .parse_env(env_logger::Env::new().filter("STITCH_LOG"))
         .target(env_logger::Target::Stderr)
         .try_init();
@@ -276,7 +282,12 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
 /// Entry point for the `stitch` binary; returns the process exit code.
 pub fn main() -> i32 {
     let cli = parse_cli(std::env::args_os()).unwrap_or_else(|e| e.exit());
-    init_logging();
+    // The session daemon logs to its own log file rather than a terminal, so
+    // it records its (infrequent) opens, resumes and swaps by default.
+    init_logging_with_default(match cli.command {
+        Command::Server { .. } => log::LevelFilter::Info,
+        _ => log::LevelFilter::Warn,
+    });
     match run(cli) {
         Ok(code) => code,
         Err(e) => {
