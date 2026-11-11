@@ -26,34 +26,46 @@ The primary use case for a `stitch` stream is to run **another** "ssh" instance 
 ## Connection initiation
 `stitch tunnel` runs `ssh` to create an initial connection to `HOST`, and starts a pair of proxy processes, which are initially communicating with each other over the original `ssh` channel.
 
-The server writes an initial metadata message (see section below), which contains the path to a rendezvous socket (located in `$XDG_RUNTIME_DIR` on the server, falling back to `/tmp`).
+The server's reply in the setup handshake (see "Tunnel setup", below) contains the path to a rendezvous socket (located in `$XDG_RUNTIME_DIR` on the server, falling back to `/tmp`).
 
 ## Proxying data
 The proxies communicate over the `ssh` channel. They speak a minimal "transport" protocol, which encapsulates data and acknowledges received data. Each proxy retains a buffer of sent-but-unacknowledged data for use during a resumption. The buffer is sized larger than a typical TCP send buffer to absorb flow during an extended offline window, but is fixed-size; if the buffer fills up, the proxy stops reading from the corresponding fd and relies on the underlying transport to eventually backpressure the sender.
 
-The proxy data plane is completely symmetric between both ends; during stitch state, absent any disconnections, the client and server behave completely symmetrically. Resumption is also parallel once a new transport channel has been established, although the process of negotiating and commencing a resumption (next section) is asymmetric.
+The proxy data plane is completely symmetric between both ends; during steady state, absent any disconnections, the client and server behave completely symmetrically. Resumption is also parallel once a new transport channel has been established, although the process of negotiating and commencing a resumption (next section) is asymmetric.
 
 ## Resumption
 The client may trigger a resumption, by initiating a new `ssh` connection, and moving the underlying transport over.
 
-In order to do so, it initiates a new ssh connection, and invokes the server-side shim, and writing a "resume" packet to its STDIN. The server-side binary connects to the rendezvous socket and forwards the resume packet, attaching stdin and stdout as `SCM_RIGHTS` auxiliary data. It then simply sleeps until the connection is closed.
+In order to do so, it initiates a new ssh connection, invokes the server-side shim, and writes a JSON "resume" message to its STDIN (see "Tunnel setup", below). The server-side shim connects to the rendezvous socket and forwards the resume message, attaching stdin and stdout as `SCM_RIGHTS` auxiliary data. It then simply sleeps until the connection is closed.
 
-Upon receipt of a resume message, the proxy server switches over to the new channel, initiating a "resume."
+Upon receipt of a valid resume message, the proxy server writes a JSON success reply to the new channel, and then switches its transport over to that channel.
+
+Each resume message carries an **epoch**: a counter which the client increments for every resume attempt it makes on a session. The server remembers the highest epoch it has accepted, and rejects (with a JSON error reply) any resume whose epoch is not strictly greater. The client only ever has one resume attempt outstanding at a time, so this is primarily a sanity check; but it protects against a stale attempt -- one the client has already abandoned, but whose resume message was still in flight -- arriving late and displacing a newer, working channel.
 
 ### Resumption details
-When the server initiates a resume, it will close the old transport channel and switch to the new one. It will re-send any sent-but-unacknowledged data to the new channel, including a "resumption successful" flag in the first frame.
+The JSON handshake is used only to hand off to a new channel; it carries no stream offsets. All offset tracking and acknowledgement lives in the in-band framing protocol. This matters because a resume may be speculative (see "Choosing to resume"): the old channel can continue to carry data while the new one is being established, so any offsets exchanged during the handshake could be stale by the time they were used.
 
-When the client first receives traffic over the new channel, it will swap it in in a essentially-symmetric fashion, dropping its old transport stream, resending sent-but-unacknowledged data, and then continuing.
+The protocol core does not see the JSON handshake, and has no notion of "resume" as such. It is handed a new channel via a "swap channel" operation: the server performs this when it accepts a resume message, and the client when it receives the server's JSON success reply. Until that point, each end continues to use the old channel as normal.
 
-Following resume, each end may receive duplicated data on the new "receive" fd, if its acknowledgements were not fully received on the old channel; it will discard any data up until the proper high-water-mark, in order to prevent the static side from seeing duplicate data.
+On a channel swap, each end behaves identically:
+- It drops the old channel, discarding any partially-read frame.
+- It rewinds its send position to its first unacknowledged offset: all sent-but-unacknowledged data moves back to the head of the pending-send buffer. The swap itself does not write anything; it only updates buffers and offsets, and the normal send path then delivers the data on the new channel like any other pending data. In particular, this means the re-send is subject to the usual backpressure mechanism. Any data written to the old channel which the peer did not receive is, by construction, unacknowledged, and so is covered by this.
+- It sets a "first frame on this channel" flag on the first frame it sends, and expects that flag on the first frame it receives. The flag is set on the first frame of **every** channel, in both directions, including the initial one, and never on any later frame. It is not strictly necessary, but serves as a consistency check for the core that the peer agrees a new channel has started.
 
-Once the stream has been resynchronized, we never expect duplicated data, and duplicate or out-of-order traffic results in an error and a closing of the stream.
+Following a swap, each end may receive data it has already seen, either because its acknowledgements were not fully received on the old channel, or because it received the data over the old channel while the resume was in progress. The receiver is therefore briefly in a "catching up" state. This state is not tracked separately; it is determined entirely by comparing offsets:
+- The first frame on a channel may start at any offset at or below the receiver's current high-water mark. While incoming frames lie below the high-water mark, the receiver discards the already-received portion, in order to prevent the application from seeing duplicate data.
+- Once a frame has reached the high-water mark, the stream is resynchronized. From then on, each frame must begin exactly where the previous one ended; duplicate or out-of-order traffic results in an error and a closing of the stream.
+- A frame which begins beyond the high-water mark (a gap), or an acknowledgement of data which was never sent, is an error at any time.
 
 ### Security of resumption
 Resuming a connection requires access to the rendezvous socket on disk. This is a similar security model to tools like `screen` or `tmux`. No part of this system directly listens on a TCP port or outside of the machine in any way; all network access happens via `ssh` tunnels.
 
 ### Choosing to resume
-The client is in charge of initiating resumption. Note that the client can initiate a resumption concurrently with the operation of the existing connection; the new channel is not swapped in until it's successfully initiated.
+The client is in charge of initiating resumption. The client has at most one resume attempt outstanding at a time; it abandons (killing the corresponding `ssh`) any failed or timed-out attempt before starting another, with a new epoch.
+
+Resumption may be **speculative**: the client can initiate a resumption concurrently with the operation of the existing connection, and the new channel is not swapped in until it's successfully established. Establishing a new channel requires a full `ssh` handshake, which is slow relative to a transient network blip; so the old channel may well recover and carry further traffic while the resume is in progress. This is fine: the client keeps using the old channel until the new one is ready, and then switches regardless.
+
+While a resume attempt is outstanding, the client expects the old channel to fail -- the server closes it when it switches over -- and so an EOF or error on the old channel, or the exit of the old `ssh` process, does not trigger a further resume attempt.
 
 The client triggers a resumption:
 - If the active `ssh` process exits
@@ -68,7 +80,7 @@ Heartbeat duration and timeout are configurable, but will probably default to so
 
 When initiating or resuming a connection, it is necessary to exchange some out-of-band metadata, before shifting to the transport protocol.
 
-For these interactions, the client will `ssh` to the server, and invoke the server-side binary (something like `stitch _server-shim`). The client first writes a message, and then the server replies. After one message in each direction, the channel switches over to the framed transport protocol (or shuts down, in the case of error).
+For these interactions, the client will `ssh` to the server, and invoke the server-side binary (something like `stitch _server-shim`). The client first writes a message, and then the server side replies with exactly one message, indicating either success or failure. On success, the channel then switches over to the framed transport protocol; on failure, it shuts down. For a resume, a success reply is written by the proxy server itself (on the file descriptors passed to it by the shim), while a failure may be reported either by the proxy server (e.g. for a stale epoch) or directly by the shim (e.g. if it cannot reach the rendezvous socket).
 
 The format for these bootstrap messages is length-delimited JSON, where the length is encoded as a 32-bit number expressed as an 8-digit hexadecimal number.
 
@@ -85,7 +97,7 @@ The transport layer has a "shutdown" flag, which can be set to indicate the shut
 Each direction can be shutdown independently. Once either end has seen both a shutdown, and an acknowledgement of its own shutdown, it can terminate and close down entirely.
 
 ### Crashed server
-If the client attempts to resume, and discovers that the rendezvous socket is missing or disconnnected, it will shut down. This is implemented by the "resume" shim on the remote side writing an error frame to its stdout, which will be received by the proxy process to trigger a shutdown. This behavior means that if the server ever shuts down, the client will eventually discover this fact and exit. Similar behavior applies if the server reboots or the server process crashes.
+If the client attempts to resume, and discovers that the rendezvous socket is missing or disconnnected, it will shut down. This is implemented by the "resume" shim on the remote side writing a JSON error reply (as in "Tunnel setup") to its stdout, which will be received by the client to trigger a shutdown. This behavior means that if the server ever shuts down, the client will eventually discover this fact and exit. Similar behavior applies if the server reboots or the server process crashes.
 
 ## Open Questions/notes
 - What happens if the client exists ungracefully? Does the server ever shut down automatically?
