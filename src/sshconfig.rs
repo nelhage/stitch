@@ -82,10 +82,28 @@ pub fn proxy_command(exe: &Path, args: &str) -> anyhow::Result<String> {
 /// The arguments (excluding `argv[0]`) with which `stitch ssh HOST args...`
 /// runs `ssh`:
 /// `-o ProxyCommand=<exe> tunnel %h -o ControlPath=none -o ServerAliveInterval=0 -o TCPKeepAlive=no HOST args...`
-pub fn ssh_args(exe: &Path, host: &OsStr, args: &[OsString]) -> anyhow::Result<Vec<OsString>> {
+///
+/// With `stitch_binary`, the tunnel is run as
+/// `<exe> tunnel --stitch-binary=<stitch_binary> %h`, to find `stitch` on the
+/// remote host there rather than on its `$PATH`.
+pub fn ssh_args(
+    exe: &Path,
+    stitch_binary: Option<&str>,
+    host: &OsStr,
+    args: &[OsString],
+) -> anyhow::Result<Vec<OsString>> {
+    let mut tunnel = String::from("tunnel");
+    if let Some(bin) = stitch_binary {
+        if bin.contains(['\n', '\r']) {
+            bail!("--stitch-binary contains a newline: {bin:?}");
+        }
+        tunnel.push_str(" --stitch-binary=");
+        tunnel.push_str(&shell_quote(bin).replace('%', "%%"));
+    }
+    tunnel.push_str(" %h");
     let mut out: Vec<OsString> = vec![
         "-o".into(),
-        format!("ProxyCommand={}", proxy_command(exe, "tunnel %h")?).into(),
+        format!("ProxyCommand={}", proxy_command(exe, &tunnel)?).into(),
     ];
     for (k, v) in INNER_SSH_OPTIONS {
         out.push("-o".into());
@@ -98,12 +116,12 @@ pub fn ssh_args(exe: &Path, host: &OsStr, args: &[OsString]) -> anyhow::Result<V
 
 /// `stitch ssh`: replace this process with `ssh` (see [`ssh_args`]). Only
 /// returns on failure.
-pub fn exec_ssh(host: &OsStr, args: &[OsString]) -> anyhow::Error {
+pub fn exec_ssh(stitch_binary: Option<&str>, host: &OsStr, args: &[OsString]) -> anyhow::Error {
     let exe = match std::env::current_exe().context("cannot find path to stitch") {
         Ok(exe) => exe,
         Err(e) => return e,
     };
-    let args = match ssh_args(&exe, host, args) {
+    let args = match ssh_args(&exe, stitch_binary, host, args) {
         Ok(a) => a,
         Err(e) => return e,
     };
@@ -399,6 +417,7 @@ mod tests {
     fn ssh_argument_construction() {
         let args = ssh_args(
             Path::new("/bin/stitch"),
+            None,
             OsStr::new("host"),
             &["-v".into(), "ls".into(), "-l".into()],
         )
@@ -420,6 +439,27 @@ mod tests {
                 "-l"
             ]
         );
+    }
+
+    #[test]
+    fn ssh_with_stitch_binary() {
+        for bin in ["/opt/stitch", "~/bin/stitch", "/opt/100%/my stitch"] {
+            let args =
+                ssh_args(Path::new("/bin/stitch"), Some(bin), OsStr::new("host"), &[]).unwrap();
+            let pc = args[1].to_str().unwrap();
+            let pc = pc.strip_prefix("ProxyCommand=").unwrap();
+            assert_eq!(
+                run_like_ssh(pc, "example.com"),
+                [
+                    "/bin/stitch",
+                    "tunnel",
+                    &format!("--stitch-binary={bin}"),
+                    "example.com"
+                ],
+                "{pc}"
+            );
+        }
+        assert!(ssh_args(Path::new("/bin/stitch"), Some("a\nb"), OsStr::new("h"), &[]).is_err());
     }
 
     #[test]

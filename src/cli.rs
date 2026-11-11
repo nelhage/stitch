@@ -106,6 +106,11 @@ pub struct TunnelOpts {
 
 #[derive(Debug, Args)]
 pub struct SshOpts {
+    /// Location of the stitch binary on HOST, instead of looking it up on the
+    /// remote PATH (passed on to `stitch tunnel --stitch-binary`)
+    #[arg(long, value_name = "PATH")]
+    pub stitch_binary: Option<String>,
+
     /// Host to connect to
     pub host: OsString,
 
@@ -190,35 +195,39 @@ impl TunnelOpts {
 
 /// Parse a command line (including `argv[0]`).
 ///
-/// This differs from `Cli::try_parse_from` in one respect: `clap` swallows a
-/// `--` which immediately follows `stitch ssh HOST`, but `ssh` gives it
-/// meaning (`ssh HOST -- -x` runs the remote command `-x`), so we restore it
-/// in order to pass the arguments through verbatim.
+/// This differs from `Cli::try_parse_from` for `stitch ssh`: everything after
+/// HOST belongs to `ssh` and is passed through verbatim, so `clap` only sees
+/// the command line up to and including HOST. Otherwise `clap` would swallow a
+/// `--` which immediately follows HOST, to which `ssh` gives meaning
+/// (`ssh HOST -- -x` runs the remote command `-x`), and would claim
+/// `--stitch-binary` if it came first after HOST.
 pub fn parse_cli<I, T>(args: I) -> Result<Cli, clap::Error>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString>,
 {
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
-    let mut cli = Cli::try_parse_from(&args)?;
-    if let Command::Ssh(opts) = &mut cli.command {
-        // There are no options before the subcommand, nor (other than
-        // `--help`) after it, so the raw command line is
-        // `stitch ssh [--] HOST ARGS...`.
-        let host_at = if args.get(2).is_some_and(|a| a == "--") {
-            3
-        } else {
-            2
-        };
-        // Restore the `--` only if the raw arguments after HOST are exactly
-        // `--` followed by what clap gave us.
-        if let Some(rest) = args.get(host_at + 1..)
-            && args[host_at] == opts.host
-            && rest.first().is_some_and(|a| a == "--")
-            && rest[1..] == opts.args[..]
-        {
-            opts.args.insert(0, "--".into());
+    if args.get(1).is_none_or(|a| a != "ssh") {
+        return Cli::try_parse_from(&args);
+    }
+    // There are no options before the subcommand, and the only option after
+    // it (other than `--help`) is `--stitch-binary`, so the command line is
+    // `stitch ssh [--stitch-binary[=]PATH] [--] HOST ARGS...`.
+    let mut host_at = 2;
+    if let Some(a) = args.get(host_at) {
+        if a == "--stitch-binary" {
+            host_at += 2;
+        } else if a.as_encoded_bytes().starts_with(b"--stitch-binary=") {
+            host_at += 1;
         }
+    }
+    if args.get(host_at).is_some_and(|a| a == "--") {
+        host_at += 1;
+    }
+    let split = (host_at + 1).min(args.len());
+    let mut cli = Cli::try_parse_from(&args[..split])?;
+    if let Command::Ssh(opts) = &mut cli.command {
+        opts.args = args[split..].to_vec();
     }
     Ok(cli)
 }
@@ -284,7 +293,11 @@ fn ssh_config(opts: SshConfigOpts) -> anyhow::Result<i32> {
 pub fn run(cli: Cli) -> anyhow::Result<i32> {
     match cli.command {
         Command::Tunnel(opts) => crate::client::run_tunnel(opts.resolve()?),
-        Command::Ssh(opts) => Err(sshconfig::exec_ssh(&opts.host, &opts.args)),
+        Command::Ssh(opts) => Err(sshconfig::exec_ssh(
+            opts.stitch_binary.as_deref(),
+            &opts.host,
+            &opts.args,
+        )),
         Command::SshConfig(opts) => ssh_config(opts),
         Command::ServerShim => crate::server::run_shim(),
         Command::Server { listen_fd } => crate::server::run_daemon(listen_fd),
@@ -481,6 +494,37 @@ mod tests {
         };
         assert_eq!(s.args, ["--"]);
         assert!(parse(&["ssh"]).is_err());
+        assert_eq!(s.stitch_binary, None);
+    }
+
+    #[test]
+    fn ssh_stitch_binary() {
+        for argv in [
+            &["ssh", "--stitch-binary=/opt/stitch", "host", "--", "x"][..],
+            &["ssh", "--stitch-binary", "/opt/stitch", "host", "--", "x"][..],
+            &[
+                "ssh",
+                "--stitch-binary",
+                "/opt/stitch",
+                "--",
+                "host",
+                "--",
+                "x",
+            ][..],
+        ] {
+            let Command::Ssh(s) = parse(argv).unwrap() else {
+                panic!()
+            };
+            assert_eq!(s.stitch_binary.as_deref(), Some("/opt/stitch"), "{argv:?}");
+            assert_eq!(s.host, "host", "{argv:?}");
+            assert_eq!(s.args, ["--", "x"], "{argv:?}");
+        }
+        // After HOST, it is an ssh argument like any other.
+        let Command::Ssh(s) = parse(&["ssh", "host", "--stitch-binary=x"]).unwrap() else {
+            panic!()
+        };
+        assert_eq!(s.stitch_binary, None);
+        assert_eq!(s.args, ["--stitch-binary=x"]);
     }
 
     #[test]
