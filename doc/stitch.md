@@ -21,6 +21,7 @@ The primary use case for a `stitch` stream is to run **another** "ssh" instance 
 - In order to achieve a stable `ssh` connection, `stitch tunnel` can be used as an ssh `ProxyCommand`
     - e.g. `ssh HOST -o ProxyCommand="stitch tunnel %h 127.0.0.1:%p"`
 - `stitch ssh HOST` will invoke `ssh` with `stitch` as an appropriate `ProxyCommand` and set various other `ssh` configuration options to establish a reliable tunnel.
+- `stitch tunnel` and `stitch ssh` both accept `--remote-stitch=CMD`, giving the `stitch` command to run on the remote host (e.g. a path to the binary), instead of relying on the remote `PATH`. Like `rsync --rsync-path` or `xpra --remote-xpra`, it is interpreted by the remote shell.
 - `stitch ssh-config` will set up `ssh` configuration such that `ssh HOST.stitch` will work for arbitrary `HOST`
 
 # Implementation
@@ -144,6 +145,8 @@ The shutdown occupies a position in the stream, but no space in the peer's recei
 A proxy acknowledges a shutdown when it receives it, but does not shut down the corresponding local fd until all preceding data in its receive buffer has been delivered to the application.
 
 Each direction can be shutdown independently. Once either end has seen a shutdown, seen an acknowledgement of its own shutdown, and delivered the entire contents of its receive buffer to its local application, it can terminate and close down entirely.
+
+As with TCP's `TIME_WAIT`, the end which sends the last acknowledgement cannot know that it arrived. The client exits once it has finished, closing its channel. The server, once finished, therefore lingers for a while rather than exiting at once: it keeps the channel open, and still accepts resumes, until the client closes the channel or a timeout passes. A client which missed the final acknowledgement resumes, and receives it on the new channel. Conversely, a client which has received everything it needs (its own shutdown acknowledged, and the server's shutdown received) does not treat a missing server session as an error.
 
 ### Crashed server
 If the client attempts to resume, and discovers that the rendezvous socket is missing or disconnnected, it will shut down. This is implemented by the "resume" shim on the remote side writing a JSON error reply (as in "Tunnel setup") to its stdout, which will be received by the client to trigger a shutdown. This behavior means that if the server ever shuts down, the client will eventually discover this fact and exit. Similar behavior applies if the server reboots or the server process crashes.
