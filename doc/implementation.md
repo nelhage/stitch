@@ -124,7 +124,18 @@ Rendezvous directory: `$XDG_RUNTIME_DIR/stitch` (if that is set to an absolute p
 - The first must be an `open`. The daemon connects to the target (TCP, or spawns the command), replies `ok` on the passed stdout fd (or `error`, then exits), and installs the channel.
 - Thereafter, only `resume`s with an epoch strictly greater than the highest accepted are allowed; others get an `error` written to their fds, which are then closed. On acceptance it writes `ok`, swaps the channel, and closes the previous channel's fds and Unix connection (which lets the previous shim exit).
 - It exits when the session is finished (or on a protocol error), removing its socket.
-- Logging goes to stderr (i.e. the session log), controlled by `STITCH_LOG`.
+- Logging goes to stderr (i.e. the session log), controlled by `STITCH_LOG`. Since that is a file rather than a terminal, the daemon's default level is `info` (it logs opens, resumes, channel losses and timeouts), where everything else defaults to `warn`.
+
+Concrete choices:
+
+- The shim spawns the daemon as `<current_exe> _server --listen-fd <N>`, where `N` is the listener's own fd number; `FD_CLOEXEC` is cleared on exactly that fd in a `pre_exec` hook (which also calls `setsid`). The daemon finds its socket path (and so its session id, the file stem) from the listener's address. The environment, including `STITCH_LOG` and `SSH_CONNECTION`, is inherited.
+- If the `open` cannot be served by the shim (no rendezvous directory, cannot bind or spawn), the shim replies `internal`; a message which is not an `open` or `resume` gets `bad_request`.
+- Timeouts in the daemon: 30 s for the shim which spawned it to connect, 10 s for any connection to deliver its message and fds (connections are received concurrently with the running session), 5 s to write an `error` reply, 10 s to connect to a TCP target.
+- A `resume` naming a different session id gets `no_session`; a second `open` gets `bad_request`.
+- The `ok` reply is written by the runtime as a *preamble* on the new channel, ahead of the first frame, so that writing it never blocks the session.
+- The server's `Config::heartbeat_interval` is the `open`'s `heartbeat_ms` (the default if 0), and its `Config::timeout` is three heartbeat intervals; it only logs a timeout.
+- A TCP target is connected with `TCP_NODELAY`; its write side is shut down (`shutdown(SHUT_WR)`) when the client's stream ends. A command target's stdin is closed instead. The daemon reaps a command target when it exits, but does not kill it when the session finishes.
+- When the current channel is lost (EOF or error), the daemon also closes the shim's Unix connection, so that the shim exits, as `ssh` would expect of a dead session.
 
 # Client side (`client`)
 
@@ -133,9 +144,26 @@ Rendezvous directory: `$XDG_RUNTIME_DIR/stitch` (if that is set to an absolute p
 - The initial open has no timeout of our own: the user may be authenticating. If it fails, `stitch tunnel` exits non-zero.
 - Resume triggers, per `stitch.md`: active `ssh` exits, EOF/error on the channel, or `Session` reports a timeout. None of these trigger a further attempt while one is outstanding.
 - A resume attempt is abandoned (its `ssh` killed) if it has not received a reply within `--connect-timeout` (default 30 s) or its `ssh` exits first. Retries back off exponentially from 1 s to 30 s, indefinitely.
-- An `error` reply to a resume is fatal: the client exits non-zero.
+- An `error` reply to a resume is fatal: the client exits non-zero ("remote session is gone"). There is one exception, the stream equivalent of TCP's `TIME_WAIT` problem: if our shutdown has been acknowledged and the peer's shutdown received and everything before it delivered, the only thing the server can be missing is our final acknowledgement, so it has almost certainly finished. Then an `error` reply, or a failed attempt, means exit 0.
 - On success, the old `ssh` is killed, the new channel installed, and `swap_channel` called.
 - When the session finishes, the client flushes, closes the channel, waits briefly for `ssh` to exit (killing it otherwise), and exits 0.
+
+Concrete choices:
+
+- The resume triggers are evaluated as a level, not an edge: whenever no attempt is outstanding and no backoff delay is pending, an attempt starts if the channel has been lost, the active `ssh` has exited, or the session is timed out. An attempt failing therefore leads to another after the backoff only if the channel still needs replacing; events on the old channel while an attempt is outstanding start nothing.
+- The backoff resets to 1 s after a successful attempt.
+- Each attempt is a future owning its `ssh` child (spawned with `kill_on_drop`), so abandoning it is dropping it.
+- "Briefly" is 3 s; the final flush is bounded by 2 s.
+- The client's own stdin and stdout are taken over: they are `dup`ed and fds 0 and 1 replaced with `/dev/null`, so that closing our copy of stdout delivers EOF. Pipes and terminals are reopened through `/proc/self/fd` so that `O_NONBLOCK` stays private to us (other processes, such as the user's shell, may share the original open file description); anything else is `dup`ed, and its flags restored on exit. A closed stdin counts as empty; a closed stdout as one that cannot be written.
+
+# Runtime (`runtime`)
+
+`runtime::Pump` is the tokio (current-thread) driver shared by the client and the daemon. It owns a `core::Session`, the application (`runtime::App`, a pair of fds) and the current channel (a read fd and a write fd). Every fd is non-blocking and registered with tokio's reactor (`runtime::fdio::FdIo`, built on `AsyncFd`); an fd `epoll` cannot watch (a regular file, `/dev/null`) is used synchronously, since reading or writing it never blocks for long.
+
+- `Pump::next_event()` does IO until there is something for the owner: `ChannelLost` (EOF or an error on the channel; the pump drops the channel and carries on with the application side), `TimedOut` (reported once each time the session's timeout latches; `Pump::timed_out()` gives the level), `Finished` (after closing the application and flushing output, bounded by 2 s), or `ProtocolError`. The last two are terminal. It is cancel-safe, so the owner `select!`s between it and its own work.
+- `Pump::install_channel()` swaps in a new channel at any time (closing the old one) and calls `swap_channel`. A channel may carry a preamble to be written before any frame.
+- Each step waits for whichever of these is possible and does one non-blocking `read`/`write`: read the channel (always); write pending output to the channel; write `app_data()` to the application; read the application (only while `send_space() > 0`); sleep until `poll_timeout()` and call `handle_timeout`. It checks `transmit_data` before every wait.
+- When the session reports `app_eof()`, the application's write side is closed (`shutdown(SHUT_WR)` for a socket, since another fd refers to it for reading). EOF or an error reading the application means `close_app_send()`. An error writing to it (typically `EPIPE` or `ECONNRESET`) means `close_app_read()`.
 
 `stitch ssh HOST [args...]` execs `ssh -o ProxyCommand='<stitch> tunnel %h' -o ServerAliveInterval=0 -o TCPKeepAlive=no HOST args...` (the inner ssh never sees network failures except as a stall, which must not kill it). `<stitch>` is the absolute path of the running binary, shell-quoted (`ssh` runs the `ProxyCommand` with the user's shell) and with any `%` doubled (`ssh` expands `%` tokens). `args` are passed through verbatim, including a `--` directly after `HOST`.
 
@@ -149,5 +177,6 @@ Rendezvous directory: `$XDG_RUNTIME_DIR/stitch` (if that is set to an absolute p
 # Testing
 
 - `core`: unit tests, plus a deterministic simulation harness (`tests/sim.rs` and/or `src/core/sim.rs`) driving two sessions over simulated channels with seeded randomness — drops, stalls, swaps (including speculative ones), slow and non-reading applications, shutdowns — checked with `proptest`. It checks the invariants from `stitch.md`: byte streams arrive intact and in order; the receive buffer never exceeds its capacity; no data is ever sent beyond the send limit; with an application which never reads, heartbeats continue to flow and no timeout fires.
-- Process-level integration tests use a fake `ssh` (`--ssh` pointing at a script that runs the remote command locally), so the full client/shim/daemon path runs without `sshd`. Killing the fake `ssh` simulates a dropped connection.
+- `runtime`: unit tests run two pumps against each other over pipes and socket pairs, in one process, including channel swaps mid-transfer.
+- Process-level integration tests (`tests/tunnel.rs`) use a fake `ssh` (`tests/fake-ssh`, passed with `--ssh`), a script that ignores options and the host and runs the remote command locally, so the full client/shim/daemon path runs without `sshd`. Like a real `ssh`, it relays through intermediate processes (two `cat`s), so that killing them simulates a dropped connection and stopping them (`SIGSTOP`) a stalled one. It logs its pids, and can be told to fail or to be slow, for testing retries and abandoned attempts.
 - A small e2e smoke test runs a real unprivileged `sshd` when one is available, and skips otherwise.
