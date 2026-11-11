@@ -870,6 +870,27 @@ fn final_ack_lost_resume_during_linger() {
 }
 
 #[test]
+fn ssh_exits_before_the_channel_closes() {
+    // An ssh which exits while its channel is still open (held by another
+    // process) is not, by itself, a reason to resume at once: the channel
+    // may still carry the end of the session.
+    let env = Env::new();
+    fs::write(env.path("detach"), "").unwrap();
+    let mut t = env.tunnel_with(&["--", "echo", "hello"], |cmd| {
+        cmd.env("FAKE_SSH_DETACH", env.path("detach"));
+    });
+    drop(t.stdin.take());
+    let out = t.drain(Arc::default());
+    let status = t.wait();
+    assert!(status.success(), "{status}");
+    assert_eq!(out.join().unwrap(), b"hello\n");
+    let log = client_log(&env);
+    assert!(log.contains("ssh exited"), "{log}");
+    assert!(!log.contains("reconnecting"), "{log}");
+    env.assert_cleaned_up();
+}
+
+#[test]
 fn session_end_stress() {
     // Many short sessions at once, with readers which pause, to shake out
     // races at the end of a session.

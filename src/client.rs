@@ -33,6 +33,12 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// finished, before killing it.
 const EXIT_WAIT: Duration = Duration::from_secs(3);
 
+/// How long the channel may outlive the active `ssh` before we treat it as
+/// lost. An `ssh` normally exits only after writing everything it received
+/// to the channel, so we keep reading until EOF; this bounds the wait in
+/// case some other process (a child of `ssh`, say) holds the channel open.
+const SSH_EXIT_GRACE: Duration = Duration::from_millis(1500);
+
 /// Fully-resolved configuration for `stitch tunnel`, produced by the CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelArgs {
@@ -65,8 +71,9 @@ pub struct TunnelArgs {
 ///   an `open` (epoch 0) and waits, with no timeout of its own, for the reply;
 ///   if the open fails, returns an error (non-zero exit).
 /// - Resumes (new `ssh`, `resume` message with the next epoch) when the
-///   active `ssh` exits, the channel reaches EOF or errors, or the session
-///   reports a transport timeout; never while an attempt is outstanding.
+///   channel reaches EOF or errors, the session reports a transport timeout,
+///   or the active `ssh` has exited and the channel has not reached EOF
+///   within a short grace period; never while an attempt is outstanding.
 /// - Abandons (kills) an attempt with no reply within `connect_timeout` or
 ///   whose `ssh` exits first; retries back off exponentially from 1 s to 30 s,
 ///   indefinitely. An `error` reply to a resume is fatal, unless we have
@@ -178,13 +185,25 @@ async fn sleep_opt(at: Option<Instant>) {
 /// The `ssh` process carrying the current channel.
 struct ActiveSsh {
     child: Child,
-    exited: bool,
+    /// When the process was seen to exit.
+    exited_at: Option<Instant>,
 }
 
 impl ActiveSsh {
+    fn new(child: Child) -> ActiveSsh {
+        ActiveSsh {
+            child,
+            exited_at: None,
+        }
+    }
+
+    fn exited(&self) -> bool {
+        self.exited_at.is_some()
+    }
+
     /// Waits for the process to exit, or forever if it already has.
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        if self.exited {
+        if self.exited() {
             std::future::pending().await
         } else {
             self.child.wait().await
@@ -241,10 +260,7 @@ impl Client {
             session,
             socket,
             pump,
-            active: ActiveSsh {
-                child,
-                exited: false,
-            },
+            active: ActiveSsh::new(child),
             attempt: None,
             epoch: 0,
             backoff: INITIAL_BACKOFF,
@@ -256,9 +272,21 @@ impl Client {
         result
     }
 
-    /// Whether the current channel needs replacing: a resume trigger.
+    /// Whether the current channel needs replacing: a resume trigger. The
+    /// exit of the active `ssh` counts only once the channel has outlived it
+    /// by [`SSH_EXIT_GRACE`]; until then, we keep reading what it wrote.
     fn channel_broken(&self) -> bool {
-        !self.pump.has_channel() || self.active.exited || self.pump.timed_out()
+        !self.pump.has_channel()
+            || self.pump.timed_out()
+            || self
+                .ssh_exit_deadline()
+                .is_some_and(|t| t <= Instant::now())
+    }
+
+    /// When the exit of the active `ssh` becomes a resume trigger, if it has
+    /// exited.
+    fn ssh_exit_deadline(&self) -> Option<Instant> {
+        self.active.exited_at.map(|t| t + SSH_EXIT_GRACE)
     }
 
     /// Whether we need nothing more from the server: it has acknowledged
@@ -295,6 +323,13 @@ impl Client {
             {
                 self.start_attempt();
             }
+            // Once the active ssh's grace period runs out, wake up to
+            // re-evaluate the triggers (only if they are being evaluated, and
+            // only once).
+            let grace_end = self
+                .ssh_exit_deadline()
+                .filter(|&t| t > Instant::now())
+                .filter(|_| self.attempt.is_none() && self.retry_at.is_none());
             tokio::select! {
                 ev = self.pump.next_event() => match ev {
                     Event::Finished { flushed } => {
@@ -313,7 +348,7 @@ impl Client {
                     Event::TimedOut => log::info!("no traffic for {:?}", self.args.timeout),
                 },
                 status = self.active.wait() => {
-                    self.active.exited = true;
+                    self.active.exited_at = Some(Instant::now());
                     match status {
                         Ok(s) => log::info!("ssh exited: {s}"),
                         Err(e) => log::info!("waiting for ssh: {e}"),
@@ -326,6 +361,7 @@ impl Client {
                 () = sleep_opt(self.retry_at), if self.attempt.is_none() => {
                     self.retry_at = None;
                 }
+                () = sleep_opt(grace_end) => {}
             }
         }
     }
@@ -342,14 +378,8 @@ impl Client {
                     )));
                 }
                 log::info!("reconnected (epoch {})", self.epoch);
-                let mut old = std::mem::replace(
-                    &mut self.active,
-                    ActiveSsh {
-                        child,
-                        exited: false,
-                    },
-                );
-                if !old.exited {
+                let mut old = std::mem::replace(&mut self.active, ActiveSsh::new(child));
+                if !old.exited() {
                     let _ = old.child.start_kill();
                     tokio::spawn(async move {
                         let _ = old.child.wait().await;
@@ -397,7 +427,7 @@ impl Client {
         } = self;
         drop(pump);
         drop(attempt);
-        if !active.exited
+        if !active.exited()
             && tokio::time::timeout(EXIT_WAIT, active.child.wait())
                 .await
                 .is_err()

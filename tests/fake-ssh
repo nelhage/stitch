@@ -15,6 +15,10 @@
 #   FAKE_SSH_DELAY if set to an existing file, sleep for the number of seconds
 #                  it contains before running the command, as a slow ssh
 #                  handshake would.
+#   FAKE_SSH_DETACH if set to an existing file, leave the relays and the
+#                  remote command running in the background and exit at once,
+#                  like an ssh which exits while some other process still
+#                  holds its end of the channel.
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -44,4 +48,11 @@ if [ -n "$FAKE_SSH_DELAY" ] && [ -e "$FAKE_SSH_DELAY" ]; then
 fi
 
 relay='if [ -n "$FAKE_SSH_LOG" ]; then echo "$FAKE_SSH_ID relay $$" >> "$FAKE_SSH_LOG"; fi; exec cat'
+if [ -n "$FAKE_SSH_DETACH" ] && [ -e "$FAKE_SSH_DETACH" ]; then
+    # Without job control, a background list's stdin is /dev/null unless it
+    # is redirected explicitly.
+    exec 3<&0
+    (sh -c "$relay" <&3 3<&- | sh -c "$*" 3<&- | sh -c "$relay" 3<&-) &
+    exit 0
+fi
 sh -c "$relay" | sh -c "$*" | sh -c "$relay"
