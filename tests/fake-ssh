@@ -1,0 +1,47 @@
+#!/bin/sh
+# A stand-in for `ssh`, for the integration tests: it ignores ssh options
+# and the host, and runs the remote command locally with `sh -c`.
+#
+# Like a real ssh, it relays bytes between its own stdin/stdout and the
+# remote command through intermediate processes (two `cat`s), so that
+# killing them breaks the channel at both ends, as a network failure would.
+#
+# Environment:
+#   FAKE_SSH_LOG   if set, a file to which one line per process is appended:
+#                  "<invocation pid> <role> <pid>", where role is `ssh` (this
+#                  script) or `relay` (a `cat`).
+#   FAKE_SSH_FAIL  if set to an existing file, exit 255 at once, as ssh does
+#                  when it cannot connect.
+#   FAKE_SSH_DELAY if set to an existing file, sleep for the number of seconds
+#                  it contains before running the command, as a slow ssh
+#                  handshake would.
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) shift 2 ;;
+        -T) shift ;;
+        *) break ;;
+    esac
+done
+shift  # the host
+
+if [ -n "$FAKE_SSH_FAIL" ] && [ -e "$FAKE_SSH_FAIL" ]; then
+    echo "fake-ssh: connection refused" >&2
+    exit 255
+fi
+
+FAKE_SSH_ID=$$
+export FAKE_SSH_ID
+log() {
+    if [ -n "$FAKE_SSH_LOG" ]; then
+        echo "$FAKE_SSH_ID $1 $2" >> "$FAKE_SSH_LOG"
+    fi
+}
+log ssh $$
+
+if [ -n "$FAKE_SSH_DELAY" ] && [ -e "$FAKE_SSH_DELAY" ]; then
+    sleep "$(cat "$FAKE_SSH_DELAY")"
+fi
+
+relay='if [ -n "$FAKE_SSH_LOG" ]; then echo "$FAKE_SSH_ID relay $$" >> "$FAKE_SSH_LOG"; fi; exec cat'
+sh -c "$relay" | sh -c "$*" | sh -c "$relay"
