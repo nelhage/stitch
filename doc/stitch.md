@@ -87,7 +87,19 @@ Each direction can be shutdown independently. Once either end has seen both a sh
 ### Crashed server
 If the client attempts to resume, and discovers that the rendezvous socket is missing or disconnnected, it will shut down. This is implemented by the "resume" shim on the remote side writing an error frame to its stdout, which will be received by the proxy process to trigger a shutdown. This behavior means that if the server ever shuts down, the client will eventually discover this fact and exit. Similar behavior applies if the server reboots or the server process crashes.
 
-## Open Questions
+## Open Questions/notes
 - What happens if the client exists ungracefully? Does the server ever shut down automatically?
     - By design, we want to support very long-term disconnections, so timeouts are not a natural fit.
     - `mosh` prints a message on startup of future processes informing the user about possibly-orphaned sessions, but otherwise lets them be
+- Forwards- and backwards- compatibility
+    - The client and server may upgrade versions independently. We need to support:
+    - Client initiates a connection to a newer or older server version
+    - Server binary on-disk is upgraded, and server shim and a running server process are now different versions
+    - Client connection lifetime is bound to the lifetime of a `stitch` process, so it's not possible for the client to change versions within the lifetime of a single connection.
+- Behavior when backpressuring
+    - As envisioned, the protocol sends keepalives and other metadata in-band. If one end of the connection is **alive** but has **stopped reading data**, we will not process packets and be unable to process keepalives. Is that okay? What exactly happens in that situation?
+
+## Testing
+The whole machine should be written as a pure, IO-free core, allowing us to to test as much of the machinery as possible without invoking `ssh` or any external processes. We will set up a deterministic simulation testing harness for the core protocol machine, including fuzz testing/PBT.
+
+We will also implement an e2e test harness that runs `sshd` as an unprivileged user, but we will avoid using it for anything other than minimal smoke tests, or the occasional edge case where it's necessary to test the behavior of the actual UNIX interactions.
