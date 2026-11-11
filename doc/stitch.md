@@ -145,6 +145,8 @@ A proxy acknowledges a shutdown when it receives it, but does not shut down the 
 
 Each direction can be shutdown independently. Once either end has seen a shutdown, seen an acknowledgement of its own shutdown, and delivered the entire contents of its receive buffer to its local application, it can terminate and close down entirely.
 
+As with TCP's `TIME_WAIT`, the end which sends the last acknowledgement cannot know that it arrived. The client exits once it has finished, closing its channel. The server, once finished, therefore lingers for a while rather than exiting at once: it keeps the channel open, and still accepts resumes, until the client closes the channel or a timeout passes. A client which missed the final acknowledgement resumes, and receives it on the new channel. Conversely, a client which has received everything it needs (its own shutdown acknowledged, and the server's shutdown received) does not treat a missing server session as an error.
+
 ### Crashed server
 If the client attempts to resume, and discovers that the rendezvous socket is missing or disconnnected, it will shut down. This is implemented by the "resume" shim on the remote side writing a JSON error reply (as in "Tunnel setup") to its stdout, which will be received by the client to trigger a shutdown. This behavior means that if the server ever shuts down, the client will eventually discover this fact and exit. Similar behavior applies if the server reboots or the server process crashes.
 
