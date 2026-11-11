@@ -1,10 +1,12 @@
 //! `stitch ssh` argument construction, and `stitch ssh-config` generation and
 //! installation.
 //!
-//! Both put the absolute path of the running `stitch` binary into an `ssh`
-//! `ProxyCommand`. `ssh` performs `%`-token expansion on that string and then
-//! runs it with the user's shell (`$SHELL -c "exec <command>"`), so the path is
-//! shell-quoted and then has any `%` doubled.
+//! Both put a `stitch` command into an `ssh` `ProxyCommand`: `stitch ssh` uses
+//! the absolute path of the running binary, while `stitch ssh-config`, whose
+//! output is long-lived, uses the bare name `stitch` and relies on `$PATH`.
+//! `ssh` performs `%`-token expansion on that string and then runs it with the
+//! user's shell (`$SHELL -c "exec <command>"`), so the path is shell-quoted and
+//! then has any `%` doubled.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, OpenOptions};
@@ -18,6 +20,23 @@ use anyhow::{Context, bail};
 
 /// The suffix which `stitch ssh-config` routes through `stitch`.
 pub const HOST_SUFFIX: &str = ".stitch";
+
+/// The command `stitch ssh-config` writes into its `ProxyCommand`, to be
+/// looked up on `$PATH` when `ssh` runs it.
+pub const STITCH_COMMAND: &str = "stitch";
+
+/// Find an executable named `name` on `$PATH`, as a shell would.
+pub fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(name))
+        .find(|candidate| {
+            fs::metadata(candidate)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+}
 
 /// Name of the generated file, in `~/.ssh`.
 pub const CONF_FILE_NAME: &str = "stitch.conf";
@@ -404,6 +423,12 @@ mod tests {
         );
         assert!(s.contains("\n    ServerAliveInterval 0\n"));
         assert!(s.contains("\n    TCPKeepAlive no\n"));
+
+        let s = config_snippet(Path::new(STITCH_COMMAND)).unwrap();
+        assert!(
+            s.contains("\n    ProxyCommand stitch tunnel --strip-suffix .stitch %h\n"),
+            "{s}"
+        );
     }
 
     fn mode(p: &Path) -> u32 {

@@ -2,9 +2,10 @@
 
 use std::ffi::OsString;
 use std::os::fd::RawFd;
+use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 use clap::{Args, Parser, Subcommand};
 
 use crate::client::TunnelArgs;
@@ -235,8 +236,17 @@ pub fn init_logging_with_default(default: log::LevelFilter) {
 }
 
 fn ssh_config(opts: SshConfigOpts) -> anyhow::Result<i32> {
-    let exe = std::env::current_exe().context("cannot find path to stitch")?;
-    let snippet = sshconfig::config_snippet(&exe)?;
+    // The configuration is long-lived, so refer to `stitch` by name and let
+    // ssh find it on `$PATH`, rather than baking in the path of this binary
+    // (which, under e.g. Nix, may be garbage-collected after an upgrade).
+    let snippet = sshconfig::config_snippet(Path::new(sshconfig::STITCH_COMMAND))?;
+    if sshconfig::find_in_path(sshconfig::STITCH_COMMAND).is_none() {
+        eprintln!(
+            "stitch: warning: `{}` was not found on $PATH; `ssh HOST{}` will not work until it is",
+            sshconfig::STITCH_COMMAND,
+            sshconfig::HOST_SUFFIX,
+        );
+    }
     if opts.print {
         print!("{snippet}");
         return Ok(0);
