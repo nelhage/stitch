@@ -21,7 +21,7 @@ The primary use case for a `stitch` stream is to run **another** "ssh" instance 
 - In order to achieve a stable `ssh` connection, `stitch tunnel` can be used as an ssh `ProxyCommand`
     - e.g. `ssh HOST -o ProxyCommand="stitch tunnel %h 127.0.0.1:%p"`
 - `stitch ssh HOST` will invoke `ssh` with `stitch` as an appropriate `ProxyCommand` and set various other `ssh` configuration options to establish a reliable tunnel.
-- `stitch tunnel` and `stitch ssh` both accept `--stitch-binary=PATH`, giving the location of the `stitch` binary on the remote host, instead of relying on the remote `PATH`.
+- `stitch tunnel` and `stitch ssh` both accept `--remote-stitch=CMD`, giving the `stitch` command to run on the remote host (e.g. a path to the binary), instead of relying on the remote `PATH`. Like `rsync --rsync-path` or `xpra --remote-xpra`, it is interpreted by the remote shell.
 - `stitch ssh-config` will set up `ssh` configuration such that `ssh HOST.stitch` will work for arbitrary `HOST`
 
 # Implementation

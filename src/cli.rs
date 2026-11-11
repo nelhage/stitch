@@ -76,16 +76,16 @@ pub struct TunnelOpts {
     #[arg(short = 'o', long = "ssh-option", value_name = "OPT")]
     pub ssh_options: Vec<String>,
 
-    /// Location of the stitch binary on HOST, instead of looking it up on the
-    /// remote PATH. It is interpreted by the remote shell, so e.g.
-    /// `~/bin/stitch` works.
+    /// The stitch command to run on HOST, instead of `stitch` from the remote
+    /// PATH. It is interpreted by the remote shell, so e.g. `~/bin/stitch`
+    /// works.
     #[arg(
         long,
-        env = "STITCH_BINARY",
+        env = "STITCH_REMOTE",
         default_value = "stitch",
-        value_name = "PATH"
+        value_name = "CMD"
     )]
-    pub stitch_binary: String,
+    pub remote_stitch: String,
 
     /// Seconds between heartbeats
     #[arg(long, value_name = "SECS", default_value = "10", value_parser = parse_secs)]
@@ -106,10 +106,10 @@ pub struct TunnelOpts {
 
 #[derive(Debug, Args)]
 pub struct SshOpts {
-    /// Location of the stitch binary on HOST, instead of looking it up on the
-    /// remote PATH (passed on to `stitch tunnel --stitch-binary`)
-    #[arg(long, value_name = "PATH")]
-    pub stitch_binary: Option<String>,
+    /// The stitch command to run on HOST, instead of `stitch` from the remote
+    /// PATH (passed on to `stitch tunnel --remote-stitch`)
+    #[arg(long, value_name = "CMD")]
+    pub remote_stitch: Option<String>,
 
     /// Host to connect to
     pub host: OsString,
@@ -185,7 +185,7 @@ impl TunnelOpts {
             target,
             ssh: self.ssh,
             ssh_options: self.ssh_options,
-            stitch_binary: self.stitch_binary,
+            remote_stitch: self.remote_stitch,
             heartbeat_interval: self.heartbeat_interval,
             timeout: self.timeout,
             connect_timeout: self.connect_timeout,
@@ -200,7 +200,7 @@ impl TunnelOpts {
 /// the command line up to and including HOST. Otherwise `clap` would swallow a
 /// `--` which immediately follows HOST, to which `ssh` gives meaning
 /// (`ssh HOST -- -x` runs the remote command `-x`), and would claim
-/// `--stitch-binary` if it came first after HOST.
+/// `--remote-stitch` if it came first after HOST.
 pub fn parse_cli<I, T>(args: I) -> Result<Cli, clap::Error>
 where
     I: IntoIterator<Item = T>,
@@ -211,13 +211,13 @@ where
         return Cli::try_parse_from(&args);
     }
     // There are no options before the subcommand, and the only option after
-    // it (other than `--help`) is `--stitch-binary`, so the command line is
-    // `stitch ssh [--stitch-binary[=]PATH] [--] HOST ARGS...`.
+    // it (other than `--help`) is `--remote-stitch`, so the command line is
+    // `stitch ssh [--remote-stitch[=]CMD] [--] HOST ARGS...`.
     let mut host_at = 2;
     if let Some(a) = args.get(host_at) {
-        if a == "--stitch-binary" {
+        if a == "--remote-stitch" {
             host_at += 2;
-        } else if a.as_encoded_bytes().starts_with(b"--stitch-binary=") {
+        } else if a.as_encoded_bytes().starts_with(b"--remote-stitch=") {
             host_at += 1;
         }
     }
@@ -294,7 +294,7 @@ pub fn run(cli: Cli) -> anyhow::Result<i32> {
     match cli.command {
         Command::Tunnel(opts) => crate::client::run_tunnel(opts.resolve()?),
         Command::Ssh(opts) => Err(sshconfig::exec_ssh(
-            opts.stitch_binary.as_deref(),
+            opts.remote_stitch.as_deref(),
             &opts.host,
             &opts.args,
         )),
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn tunnel_defaults() {
         // The defaults can be overridden from the environment; skip if so.
-        if std::env::var_os("STITCH_SSH").is_some() || std::env::var_os("STITCH_BINARY").is_some() {
+        if std::env::var_os("STITCH_SSH").is_some() || std::env::var_os("STITCH_REMOTE").is_some() {
             return;
         }
         let t = tunnel(&["tunnel", "host"]).unwrap();
@@ -364,7 +364,7 @@ mod tests {
                 target: tcp("localhost", None),
                 ssh: "ssh".into(),
                 ssh_options: vec![],
-                stitch_binary: "stitch".into(),
+                remote_stitch: "stitch".into(),
                 heartbeat_interval: Duration::from_secs(10),
                 timeout: Duration::from_secs(20),
                 connect_timeout: Duration::from_secs(30),
@@ -413,7 +413,7 @@ mod tests {
             "Port=2222",
             "--ssh-option",
             "User=me",
-            "--stitch-binary",
+            "--remote-stitch",
             "/opt/stitch",
             "--heartbeat-interval",
             "0.25",
@@ -429,7 +429,7 @@ mod tests {
         assert_eq!(t.host, "box");
         assert_eq!(t.ssh, "/bin/fake-ssh");
         assert_eq!(t.ssh_options, ["Port=2222", "User=me"]);
-        assert_eq!(t.stitch_binary, "/opt/stitch");
+        assert_eq!(t.remote_stitch, "/opt/stitch");
         assert_eq!(t.heartbeat_interval, Duration::from_millis(250));
         assert_eq!(t.timeout, Duration::from_millis(1500));
         assert_eq!(t.connect_timeout, Duration::from_secs(3));
@@ -494,17 +494,17 @@ mod tests {
         };
         assert_eq!(s.args, ["--"]);
         assert!(parse(&["ssh"]).is_err());
-        assert_eq!(s.stitch_binary, None);
+        assert_eq!(s.remote_stitch, None);
     }
 
     #[test]
-    fn ssh_stitch_binary() {
+    fn ssh_remote_stitch() {
         for argv in [
-            &["ssh", "--stitch-binary=/opt/stitch", "host", "--", "x"][..],
-            &["ssh", "--stitch-binary", "/opt/stitch", "host", "--", "x"][..],
+            &["ssh", "--remote-stitch=/opt/stitch", "host", "--", "x"][..],
+            &["ssh", "--remote-stitch", "/opt/stitch", "host", "--", "x"][..],
             &[
                 "ssh",
-                "--stitch-binary",
+                "--remote-stitch",
                 "/opt/stitch",
                 "--",
                 "host",
@@ -515,16 +515,16 @@ mod tests {
             let Command::Ssh(s) = parse(argv).unwrap() else {
                 panic!()
             };
-            assert_eq!(s.stitch_binary.as_deref(), Some("/opt/stitch"), "{argv:?}");
+            assert_eq!(s.remote_stitch.as_deref(), Some("/opt/stitch"), "{argv:?}");
             assert_eq!(s.host, "host", "{argv:?}");
             assert_eq!(s.args, ["--", "x"], "{argv:?}");
         }
         // After HOST, it is an ssh argument like any other.
-        let Command::Ssh(s) = parse(&["ssh", "host", "--stitch-binary=x"]).unwrap() else {
+        let Command::Ssh(s) = parse(&["ssh", "host", "--remote-stitch=x"]).unwrap() else {
             panic!()
         };
-        assert_eq!(s.stitch_binary, None);
-        assert_eq!(s.args, ["--stitch-binary=x"]);
+        assert_eq!(s.remote_stitch, None);
+        assert_eq!(s.args, ["--remote-stitch=x"]);
     }
 
     #[test]

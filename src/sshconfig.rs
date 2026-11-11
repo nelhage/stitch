@@ -83,21 +83,21 @@ pub fn proxy_command(exe: &Path, args: &str) -> anyhow::Result<String> {
 /// runs `ssh`:
 /// `-o ProxyCommand=<exe> tunnel %h -o ControlPath=none -o ServerAliveInterval=0 -o TCPKeepAlive=no HOST args...`
 ///
-/// With `stitch_binary`, the tunnel is run as
-/// `<exe> tunnel --stitch-binary=<stitch_binary> %h`, to find `stitch` on the
+/// With `remote_stitch`, the tunnel is run as
+/// `<exe> tunnel --remote-stitch=<remote_stitch> %h`, to find `stitch` on the
 /// remote host there rather than on its `$PATH`.
 pub fn ssh_args(
     exe: &Path,
-    stitch_binary: Option<&str>,
+    remote_stitch: Option<&str>,
     host: &OsStr,
     args: &[OsString],
 ) -> anyhow::Result<Vec<OsString>> {
     let mut tunnel = String::from("tunnel");
-    if let Some(bin) = stitch_binary {
+    if let Some(bin) = remote_stitch {
         if bin.contains(['\n', '\r']) {
-            bail!("--stitch-binary contains a newline: {bin:?}");
+            bail!("--remote-stitch contains a newline: {bin:?}");
         }
-        tunnel.push_str(" --stitch-binary=");
+        tunnel.push_str(" --remote-stitch=");
         tunnel.push_str(&shell_quote(bin).replace('%', "%%"));
     }
     tunnel.push_str(" %h");
@@ -116,12 +116,12 @@ pub fn ssh_args(
 
 /// `stitch ssh`: replace this process with `ssh` (see [`ssh_args`]). Only
 /// returns on failure.
-pub fn exec_ssh(stitch_binary: Option<&str>, host: &OsStr, args: &[OsString]) -> anyhow::Error {
+pub fn exec_ssh(remote_stitch: Option<&str>, host: &OsStr, args: &[OsString]) -> anyhow::Error {
     let exe = match std::env::current_exe().context("cannot find path to stitch") {
         Ok(exe) => exe,
         Err(e) => return e,
     };
-    let args = match ssh_args(&exe, stitch_binary, host, args) {
+    let args = match ssh_args(&exe, remote_stitch, host, args) {
         Ok(a) => a,
         Err(e) => return e,
     };
@@ -442,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_with_stitch_binary() {
+    fn ssh_with_remote_stitch() {
         for bin in ["/opt/stitch", "~/bin/stitch", "/opt/100%/my stitch"] {
             let args =
                 ssh_args(Path::new("/bin/stitch"), Some(bin), OsStr::new("host"), &[]).unwrap();
@@ -453,7 +453,7 @@ mod tests {
                 [
                     "/bin/stitch",
                     "tunnel",
-                    &format!("--stitch-binary={bin}"),
+                    &format!("--remote-stitch={bin}"),
                     "example.com"
                 ],
                 "{pc}"
