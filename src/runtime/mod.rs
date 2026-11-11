@@ -22,6 +22,11 @@
 //! and its own work (a resume attempt, accepting connections, ...), and swap
 //! in a new channel with [`Pump::install_channel`] at any time.
 //!
+//! Once the session has finished, the pump closes the application, but goes
+//! on serving the channel side (including any new channel) for as long as
+//! its owner keeps calling `next_event`: the server uses this to linger in
+//! case the client missed the final acknowledgement.
+//!
 //! Everything runs on a single-threaded tokio runtime; no fd is ever read or
 //! written in blocking mode (see [`fdio`]).
 
@@ -168,26 +173,16 @@ pub enum Event {
     /// The session has finished: both directions are shut down and all data
     /// delivered. The application's fds are closed, and pending output has
     /// been written to the channel; `flushed` is false if that failed or did
-    /// not complete within [`FLUSH_TIMEOUT`]. Terminal.
+    /// not complete within [`FLUSH_TIMEOUT`].
+    ///
+    /// Reported once. The pump then goes on serving the channel side: it
+    /// reads the channel, sends heartbeats, reports [`Event::ChannelLost`],
+    /// and on a newly installed channel sends a `FIRST` frame carrying the
+    /// final acknowledgement, for as long as the owner wants.
     Finished { flushed: bool },
-    /// The peer violated the protocol; the session is dead. Terminal.
+    /// The peer violated the protocol; the session is dead. Terminal: it is
+    /// returned again by every later call.
     ProtocolError(ProtocolError),
-}
-
-/// A terminal event, remembered so it can be returned again.
-#[derive(Debug, Clone)]
-enum Terminal {
-    Finished { flushed: bool },
-    ProtocolError(ProtocolError),
-}
-
-impl From<Terminal> for Event {
-    fn from(t: Terminal) -> Event {
-        match t {
-            Terminal::Finished { flushed } => Event::Finished { flushed },
-            Terminal::ProtocolError(e) => Event::ProtocolError(e),
-        }
-    }
 }
 
 /// Drives a [`Session`] between an application and a channel. See the
@@ -200,7 +195,8 @@ pub struct Pump {
     buf: Box<[u8]>,
     /// Whether the current timeout condition has been reported.
     timeout_reported: bool,
-    terminal: Option<Terminal>,
+    /// Whether [`Event::Finished`] has been reported.
+    finished_reported: bool,
 }
 
 /// Waits for `io` to become ready if `enabled`, and otherwise forever.
@@ -246,7 +242,7 @@ impl Pump {
             channel: None,
             buf: vec![0; READ_BUF].into_boxed_slice(),
             timeout_reported: false,
-            terminal: None,
+            finished_reported: false,
         }
     }
 
@@ -303,36 +299,28 @@ impl Pump {
         }
     }
 
-    fn finish(&mut self, t: Terminal) -> Event {
-        self.terminal = Some(t.clone());
-        t.into()
-    }
-
     /// Does IO until there is an [`Event`] for the owner, and returns it.
     ///
     /// Cancel-safe: if the future is dropped before completing, no data is
-    /// lost, and calling it again carries on. After a terminal event
-    /// ([`Event::Finished`] or [`Event::ProtocolError`]), it returns that
-    /// event again immediately.
+    /// lost, and calling it again carries on. After [`Event::ProtocolError`],
+    /// it returns that event again immediately. After [`Event::Finished`],
+    /// it carries on serving the channel (see there).
     pub async fn next_event(&mut self) -> Event {
-        if let Some(t) = &self.terminal {
-            return t.clone().into();
-        }
         loop {
             if let Some(e) = self.session.error() {
-                let e = e.clone();
-                return self.finish(Terminal::ProtocolError(e));
+                return Event::ProtocolError(e.clone());
             }
             if self.session.app_eof() {
                 self.close_app_output();
             }
-            if self.session.is_finished() {
+            if !self.finished_reported && self.session.is_finished() {
                 self.close_app_output();
                 self.app_in = None;
                 let flushed = tokio::time::timeout(FLUSH_TIMEOUT, self.flush())
                     .await
                     .unwrap_or(false);
-                return self.finish(Terminal::Finished { flushed });
+                self.finished_reported = true;
+                return Event::Finished { flushed };
             }
             if self.session.transport_timed_out() {
                 if !self.timeout_reported {

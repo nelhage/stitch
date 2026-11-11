@@ -268,3 +268,50 @@ fn reports_protocol_error() {
         assert!(matches!(p.next_event().await, Event::ProtocolError(_)));
     });
 }
+
+#[test]
+fn serves_channel_after_finish() {
+    // After `Finished`, the pump carries on serving the channel side: a new
+    // channel gets a FIRST frame with the final acknowledgement, and its
+    // loss is reported.
+    rt().block_on(async {
+        let (app_a, sock_a) = socket_app();
+        let (app_b, sock_b) = socket_app();
+        let mut a = Pump::new(config(), app_a);
+        let mut b = Pump::new(config(), app_b);
+        let (ca, cb) = channel_pair();
+        a.install_channel(ca).unwrap();
+        b.install_channel(cb).unwrap();
+        // A sends 1000 bytes, B 2000.
+        let at_a = exchange(sock_a, test_data(1000, 7));
+        let at_b = exchange(sock_b, test_data(2000, 8));
+        run_pair(&mut a, &mut b, |_, _| {}).await;
+        assert_eq!(at_a.join().unwrap().len(), 2000);
+        assert_eq!(at_b.join().unwrap().len(), 1000);
+        drop(b);
+
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let ours = OwnedFd::from(ours);
+        let ours2 = ours.try_clone().unwrap();
+        a.install_channel(Channel::new(ours, ours2)).unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; crate::frame::HEADER_LEN];
+            (&theirs).read_exact(&mut buf).unwrap();
+            (buf, theirs)
+        });
+        // No event while the channel is quiet.
+        let ev = tokio::time::timeout(Duration::from_millis(100), a.next_event()).await;
+        assert!(ev.is_err(), "{ev:?}");
+        let (buf, theirs) = reader.join().unwrap();
+        let h = crate::frame::FrameHeader::decode(&buf).unwrap();
+        assert!(h.first);
+        assert_eq!(h.ack, 2001, "acknowledges the peer's shutdown");
+        assert!(a.session().is_finished());
+
+        drop(theirs);
+        let ev = tokio::time::timeout(Duration::from_secs(5), a.next_event())
+            .await
+            .unwrap();
+        assert!(matches!(ev, Event::ChannelLost(_)), "{ev:?}");
+    });
+}
