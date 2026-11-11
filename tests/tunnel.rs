@@ -746,3 +746,124 @@ fn stdout_to_regular_file() {
     assert!(t.wait().success());
     assert!(fs::read(&path).unwrap() == data);
 }
+
+// ---------------------------------------------------------------------
+// The end of a session
+// ---------------------------------------------------------------------
+
+fn server_log(env: &Env) -> String {
+    let mut out = String::new();
+    if let Ok(d) = fs::read_dir(env.rendezvous()) {
+        for e in d.flatten() {
+            if e.path().extension().is_some_and(|e| e == "log") {
+                out += &fs::read_to_string(e.path()).unwrap_or_default();
+            }
+        }
+    }
+    out
+}
+
+fn wait_for_server_log(env: &Env, text: &str) {
+    wait_until(text, || server_log(env).contains(text));
+}
+
+/// Reads exactly `n` bytes.
+fn read_n(r: &mut impl Read, n: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf).unwrap();
+    buf
+}
+
+#[test]
+fn slow_reader_at_session_end() {
+    // The server finishes while the client still holds data for a reader
+    // which is slow to take it. The client must still deliver all of it
+    // and exit successfully.
+    let env = Env::new();
+    let len = 3_000_000;
+    let mut t = env.tunnel_with(
+        &["--", "head", "-c", &len.to_string(), "/dev/zero"],
+        |cmd| {
+            cmd.stdin(Stdio::null());
+        },
+    );
+    let mut stdout = t.stdout.take().unwrap();
+    // Enough to make the client send a window update after the server has
+    // finished.
+    let mut got = read_n(&mut stdout, 1_300_000);
+    wait_for_server_log(&env, "session finished");
+    std::thread::sleep(Duration::from_millis(500));
+    stdout.read_to_end(&mut got).unwrap();
+    assert_eq!(got.len(), len);
+    assert!(got.iter().all(|&b| b == 0));
+    let status = t.wait();
+    assert!(status.success(), "{status}");
+    env.assert_cleaned_up();
+}
+
+#[test]
+fn channel_lost_at_session_end_while_delivering() {
+    // As above, but the channel is lost once the server has finished, so
+    // the server goes away and the client's resume finds no session. The
+    // client has received everything, and so still exits successfully once
+    // it has delivered it.
+    let env = Env::new();
+    let len = 3_000_000;
+    let mut t = env.tunnel_with(
+        &["--", "head", "-c", &len.to_string(), "/dev/zero"],
+        |cmd| {
+            cmd.stdin(Stdio::null());
+        },
+    );
+    let mut stdout = t.stdout.take().unwrap();
+    let mut got = read_n(&mut stdout, 100_000);
+    wait_for_server_log(&env, "session finished");
+    env.break_connection(&env.invocation(0));
+    wait_for_client_log(&env, "reconnecting (epoch 1)");
+    std::thread::sleep(Duration::from_millis(500));
+    stdout.read_to_end(&mut got).unwrap();
+    assert_eq!(got.len(), len);
+    let status = t.wait();
+    assert!(status.success(), "{status}");
+    env.assert_cleaned_up();
+}
+
+#[test]
+fn session_end_stress() {
+    // Many short sessions at once, with readers which pause, to shake out
+    // races at the end of a session.
+    let runs: Vec<_> = (0..6u8)
+        .map(|i| {
+            std::thread::spawn(move || {
+                for j in 0..2u8 {
+                    let env = Env::new();
+                    let mut t = env.tunnel(&["--", "cat"]);
+                    let data = test_data((3 << 20) + 4099 * usize::from(i + j), i * 3 + j);
+                    let writer = t.feed(data.clone(), |_| {});
+                    let mut stdout = t.stdout.take().unwrap();
+                    let mut got = Vec::new();
+                    let mut buf = vec![0u8; 32 << 10];
+                    let mut reads = 0usize;
+                    loop {
+                        let n = stdout.read(&mut buf).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        got.extend_from_slice(&buf[..n]);
+                        reads += 1;
+                        if reads % 8 == usize::from(i % 8) {
+                            std::thread::sleep(Duration::from_millis(40));
+                        }
+                    }
+                    writer.join().unwrap();
+                    let status = t.wait();
+                    assert!(status.success(), "{status}\n{}", env.logs());
+                    assert!(got == data);
+                }
+            })
+        })
+        .collect();
+    for r in runs {
+        r.join().unwrap();
+    }
+}

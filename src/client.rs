@@ -69,7 +69,9 @@ pub struct TunnelArgs {
 ///   reports a transport timeout; never while an attempt is outstanding.
 /// - Abandons (kills) an attempt with no reply within `connect_timeout` or
 ///   whose `ssh` exits first; retries back off exponentially from 1 s to 30 s,
-///   indefinitely. An `error` reply to a resume is fatal.
+///   indefinitely. An `error` reply to a resume is fatal, unless we have
+///   already received everything we need from the server (both shutdowns
+///   are through); then we stop resuming, and finish delivering to stdout.
 /// - On success, kills the old `ssh` and swaps the channel.
 /// - When the session finishes, flushes, closes the channel, waits briefly
 ///   for `ssh` to exit (killing it otherwise), and returns `Ok(0)`.
@@ -205,6 +207,10 @@ struct Client {
     backoff: Duration,
     /// When the next attempt may start, after a failure.
     retry_at: Option<Instant>,
+    /// The server rejected a resume after we had received everything we
+    /// need from it (see [`Client::all_received`]): there is no point in
+    /// trying again, so we just finish delivering to the application.
+    server_gone: bool,
 }
 
 impl Client {
@@ -243,6 +249,7 @@ impl Client {
             epoch: 0,
             backoff: INITIAL_BACKOFF,
             retry_at: None,
+            server_gone: false,
         };
         let result = client.main_loop().await;
         client.shutdown().await;
@@ -254,13 +261,16 @@ impl Client {
         !self.pump.has_channel() || self.active.exited || self.pump.timed_out()
     }
 
-    /// Whether everything has been delivered in both directions, so that the
-    /// only thing possibly missing is the server seeing our final
-    /// acknowledgement. If the server is then gone, it has almost certainly
-    /// finished (the stream equivalent of TCP's `TIME_WAIT` problem).
-    fn all_delivered(&self) -> bool {
+    /// Whether we need nothing more from the server: it has acknowledged
+    /// our shutdown (so it holds our whole stream), and we have received its
+    /// shutdown (so we hold its whole stream, though perhaps not yet
+    /// delivered to the application). The only thing the server may still
+    /// be missing is our acknowledgement of its shutdown. If the server is
+    /// gone now, it has almost certainly finished (the stream equivalent of
+    /// TCP's `TIME_WAIT` problem), and losing it costs us nothing.
+    fn all_received(&self) -> bool {
         let s = self.pump.session();
-        s.shutdown_acked() && s.app_eof()
+        s.shutdown_acked() && s.peer_shutdown().is_some()
     }
 
     fn start_attempt(&mut self) {
@@ -278,7 +288,11 @@ impl Client {
         loop {
             // Resume triggers are level-triggered, but only act when no
             // attempt is outstanding and no backoff delay is pending.
-            if self.attempt.is_none() && self.retry_at.is_none() && self.channel_broken() {
+            if self.attempt.is_none()
+                && self.retry_at.is_none()
+                && !self.server_gone
+                && self.channel_broken()
+            {
                 self.start_attempt();
             }
             tokio::select! {
@@ -307,9 +321,7 @@ impl Client {
                 }
                 r = poll_opt(self.attempt.as_mut()) => {
                     self.attempt = None;
-                    if let Some(code) = self.attempt_done(r)? {
-                        return Ok(code);
-                    }
+                    self.attempt_done(r)?;
                 }
                 () = sleep_opt(self.retry_at), if self.attempt.is_none() => {
                     self.retry_at = None;
@@ -318,9 +330,9 @@ impl Client {
         }
     }
 
-    /// Handles the outcome of a resume attempt. Returns an exit code if the
-    /// client should now exit successfully.
-    fn attempt_done(&mut self, r: AttemptResult) -> anyhow::Result<Option<i32>> {
+    /// Handles the outcome of a resume attempt. Returns an error if the
+    /// client must give up.
+    fn attempt_done(&mut self, r: AttemptResult) -> anyhow::Result<()> {
         match r {
             Ok((child, channel)) => {
                 if let Err(e) = self.pump.install_channel(channel) {
@@ -345,30 +357,31 @@ impl Client {
                 }
                 self.backoff = INITIAL_BACKOFF;
                 self.retry_at = None;
-                Ok(None)
+                Ok(())
             }
             Err(AttemptError::Rejected(e)) => {
-                if self.all_delivered() {
+                if self.all_received() {
+                    // The pump reports `Finished` once the application has
+                    // taken everything: the session's last channel (as far
+                    // as it knows) carried all the acknowledgements it
+                    // needs.
                     log::info!(
-                        "the server session has gone ({}), but everything was delivered",
+                        "the server session has gone ({}), but everything was received",
                         e.code
                     );
-                    return Ok(Some(0));
+                    self.server_gone = true;
+                    return Ok(());
                 }
                 bail!("remote session is gone: {}: {}", e.code, e.message)
             }
             Err(AttemptError::Failed(e)) => {
-                if self.all_delivered() {
-                    log::info!("cannot reconnect ({e:#}), but everything was delivered");
-                    return Ok(Some(0));
-                }
                 log::info!(
                     "reconnect attempt failed: {e:#}; retrying in {:?}",
                     self.backoff
                 );
                 self.retry_at = Some(Instant::now() + self.backoff);
                 self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
-                Ok(None)
+                Ok(())
             }
         }
     }
