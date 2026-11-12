@@ -66,11 +66,15 @@ jobs:
           restore-keys: test-${{ runner.os }}-${{ runner.arch }}-
       # In release mode, as packagers build and test it (nixpkgs'
       # `buildRustPackage` runs `cargo test` in release mode), and as it
-      # is used.
+      # is used; but with `debug_assert!`s, which only tests need.
       - name: build
         run: cargo test --locked --release --no-run
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
       - name: test
         run: cargo test --locked --release
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
 
   # The integration tests depend on /proc, so on macOS we only check that
   # everything builds and is clippy-clean.
