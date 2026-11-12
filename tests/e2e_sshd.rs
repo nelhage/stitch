@@ -10,7 +10,8 @@
 //! rendezvous directory in the temporary directory.
 //!
 //! The tests are skipped (they pass, printing a message) if `sshd`, `ssh`
-//! or `ssh-keygen` cannot be found, or `sshd` cannot be started.
+//! or `ssh-keygen` cannot be found, or `sshd` cannot be started, unless
+//! `STITCH_E2E_REQUIRED` is set (as in CI), in which case they fail.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -75,6 +76,17 @@ struct Sshd {
     ssh: PathBuf,
 }
 
+/// Skips the calling test (by returning `None`, after printing why), or
+/// fails it if `STITCH_E2E_REQUIRED` is set.
+fn skip(why: &str) -> Option<Sshd> {
+    assert!(
+        std::env::var_os("STITCH_E2E_REQUIRED").is_none(),
+        "cannot run e2e test, and STITCH_E2E_REQUIRED is set: {why}"
+    );
+    eprintln!("skipping: {why}");
+    None
+}
+
 impl Sshd {
     /// Starts an `sshd`, or returns `None` (after printing why) if that is
     /// not possible here.
@@ -84,14 +96,12 @@ impl Sshd {
             find_program("ssh"),
             find_program("ssh-keygen"),
         ) else {
-            eprintln!("skipping: sshd, ssh or ssh-keygen not found");
-            return None;
+            return skip("sshd, ssh or ssh-keygen not found");
         };
         if nix::unistd::geteuid().is_root() {
             // A root sshd needs its privilege separation directory.
             if let Err(e) = fs::create_dir_all("/run/sshd") {
-                eprintln!("skipping: cannot create /run/sshd: {e}");
-                return None;
+                return skip(&format!("cannot create /run/sshd: {e}"));
             }
         }
         // Unix socket paths are limited to ~108 bytes, so keep this short.
@@ -197,8 +207,7 @@ impl Sshd {
             let _ = child.kill();
             let _ = child.wait();
         }
-        eprintln!("skipping: cannot start sshd");
-        None
+        skip("cannot start sshd")
     }
 
     fn path(&self, name: &str) -> PathBuf {

@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Fail, rather than skip, the sshd e2e tests if sshd can't be run.
+  STITCH_E2E_REQUIRED: "1"
+
+# Every step runs in the flake's `ci` dev shell, so that CI uses the same
+# pinned toolchain as local development (plus a pinned OpenSSH for the e2e
+# tests).
+defaults:
+  run:
+    shell: nix develop .#ci --command bash -euo pipefail {0}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: lint-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+          restore-keys: lint-${{ runner.os }}-${{ runner.arch }}-
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+          restore-keys: test-${{ runner.os }}-${{ runner.arch }}-
+      - name: build
+        run: cargo test --locked --no-run
+      - name: test
+        run: cargo test --locked
+
+  # The integration tests depend on /proc, so on macOS we only check that
+  # everything builds and is clippy-clean.
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'Cargo.lock') }}
+          restore-keys: build-${{ runner.os }}-${{ runner.arch }}-
+      - name: build
+        run: cargo test --locked --no-run
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
