@@ -7,6 +7,8 @@ use std::os::unix::net::UnixStream;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use tokio::sync::{mpsc, oneshot};
+
 use super::*;
 
 fn pipe() -> (OwnedFd, OwnedFd) {
@@ -38,19 +40,21 @@ fn test_data(len: usize, seed: u8) -> Vec<u8> {
 /// Writes `data` to `s` and then shuts down its write side; reads `s` to
 /// EOF in another thread. Returns the reader's result.
 fn exchange(s: UnixStream, data: Vec<u8>) -> JoinHandle<Vec<u8>> {
-    exchange_paced(s, data, Duration::ZERO)
+    exchange_gated(s, data, |_| {})
 }
 
-/// Like [`exchange`], but pauses for `pause` after writing each 64 KiB, so
-/// that the transfer takes a known minimum time however fast the build.
-fn exchange_paced(s: UnixStream, data: Vec<u8>, pause: Duration) -> JoinHandle<Vec<u8>> {
+/// Like [`exchange`], but calls `gate` with the offset reached before
+/// writing each 64 KiB; it may block, to hold the writer there.
+fn exchange_gated(
+    s: UnixStream,
+    data: Vec<u8>,
+    mut gate: impl FnMut(usize) + Send + 'static,
+) -> JoinHandle<Vec<u8>> {
     let mut w = s.try_clone().unwrap();
     std::thread::spawn(move || {
-        for chunk in data.chunks(64 << 10) {
+        for (i, chunk) in data.chunks(64 << 10).enumerate() {
+            gate(i * (64 << 10));
             w.write_all(chunk).unwrap();
-            if !pause.is_zero() {
-                std::thread::sleep(pause);
-            }
         }
         w.shutdown(Shutdown::Write).unwrap();
     });
@@ -60,6 +64,25 @@ fn exchange_paced(s: UnixStream, data: Vec<u8>, pause: Duration) -> JoinHandle<V
         r.read_to_end(&mut out).unwrap();
         out
     })
+}
+
+/// Runs `f` in another thread; the receiver yields its result.
+fn in_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> oneshot::Receiver<T> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx
+}
+
+/// Drives `p` until `done` completes, and returns its output. The pump
+/// must not report any event meanwhile.
+async fn drive_until<T>(p: &mut Pump, done: impl Future<Output = T>) -> T {
+    tokio::pin!(done);
+    tokio::select! {
+        ev = p.next_event() => panic!("unexpected event: {ev:?}"),
+        r = &mut done => r,
+    }
 }
 
 fn config() -> Config {
@@ -77,10 +100,22 @@ fn rt() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// Runs both pumps until both finish, calling `tick` every 5 ms with both.
-async fn run_pair(a: &mut Pump, b: &mut Pump, mut tick: impl FnMut(&mut Pump, &mut Pump)) {
+/// Runs both pumps until both finish.
+async fn run_pair(a: &mut Pump, b: &mut Pump) {
+    let (_tx, mut rx) = mpsc::unbounded_channel::<()>();
+    run_pair_with(a, b, &mut rx, |(), _, _| {}).await;
+}
+
+/// Runs both pumps until both finish, calling `on_request` with both
+/// whenever `requests` yields a request.
+async fn run_pair_with<T>(
+    a: &mut Pump,
+    b: &mut Pump,
+    requests: &mut mpsc::UnboundedReceiver<T>,
+    mut on_request: impl FnMut(T, &mut Pump, &mut Pump),
+) {
     let (mut a_done, mut b_done) = (false, false);
-    let mut interval = tokio::time::interval(Duration::from_millis(5));
+    // Only a bound on a hang, should there be one.
     let deadline = tokio::time::sleep(Duration::from_secs(30));
     tokio::pin!(deadline);
     while !(a_done && b_done) {
@@ -95,7 +130,7 @@ async fn run_pair(a: &mut Pump, b: &mut Pump, mut tick: impl FnMut(&mut Pump, &m
                 Event::ChannelLost(_) | Event::TimedOut => {}
                 e => panic!("b: {e:?}"),
             },
-            _ = interval.tick() => tick(a, b),
+            Some(req) = requests.recv() => on_request(req, a, b),
             () = &mut deadline => panic!("timed out"),
         }
     }
@@ -116,7 +151,7 @@ fn bulk_transfer_both_ways() {
         let data_b = test_data(2 << 20, 2);
         let got_b = exchange(sock_a, data_a.clone());
         let got_a = exchange(sock_b, data_b.clone());
-        run_pair(&mut a, &mut b, |_, _| {}).await;
+        run_pair(&mut a, &mut b).await;
         assert!(got_a.join().unwrap() == data_a);
         assert!(got_b.join().unwrap() == data_b);
     });
@@ -132,14 +167,13 @@ fn preamble_precedes_frames() {
         let ours2 = ours.try_clone().unwrap();
         p.install_channel(Channel::new(ours, ours2).with_preamble(b"hello".to_vec()))
             .unwrap();
-        let reader = std::thread::spawn(move || {
+        let reader = in_thread(move || {
             let mut buf = [0u8; 5 + crate::frame::HEADER_LEN];
             (&theirs).read_exact(&mut buf).unwrap();
-            buf
+            (buf, theirs)
         });
         // The first frame is written straight away.
-        let _ = tokio::time::timeout(Duration::from_millis(200), p.next_event()).await;
-        let buf = reader.join().unwrap();
+        let (buf, _theirs) = drive_until(&mut p, reader).await.unwrap();
         assert_eq!(&buf[..5], b"hello");
         let h = crate::frame::FrameHeader::decode(buf[5..].try_into().unwrap()).unwrap();
         assert!(h.first);
@@ -148,6 +182,7 @@ fn preamble_precedes_frames() {
 
 #[test]
 fn swap_mid_transfer() {
+    const MIB: usize = 1 << 20;
     rt().block_on(async {
         let (app_a, sock_a) = socket_app();
         let (app_b, sock_b) = socket_app();
@@ -157,31 +192,49 @@ fn swap_mid_transfer() {
         a.install_channel(ca).unwrap();
         b.install_channel(cb).unwrap();
 
-        let data_a = test_data(4 << 20, 3);
-        let data_b = test_data(4 << 20, 4);
-        // `run_pair` ticks every 5 ms and we swap at most once a tick, so
-        // pace the writers: unpaced, an optimized build moves all 8 MiB in a
-        // few ticks. Paced, it takes at least 64 ms (a dozen or more ticks).
-        let pause = Duration::from_millis(1);
-        let got_b = exchange_paced(sock_a, data_a.clone(), pause);
-        let got_a = exchange_paced(sock_b, data_b.clone(), pause);
-        let mut swaps = 0;
-        run_pair(&mut a, &mut b, |a, b| {
-            // Swap every megabyte or so, sometimes dropping the old channel
-            // at one end before the other end swaps.
-            let pos = a.session().send_position() + b.session().send_position();
-            if pos > (swaps + 1) * (1 << 20) && swaps < 5 {
-                swaps += 1;
-                let (ca, cb) = channel_pair();
-                if swaps % 2 == 0 {
-                    b.drop_channel();
+        // Each writer stops at every megabyte, until both have reached it
+        // and the pumps have swapped channels: so there are exactly three
+        // swaps, each with data still to come in both directions, however
+        // fast the transfer.
+        let (arrived, mut arrivals) = mpsc::unbounded_channel();
+        let stop_at_each_mib = || {
+            let arrived = arrived.clone();
+            let (go, wait) = std::sync::mpsc::channel::<()>();
+            let gate = move |offset: usize| {
+                if offset > 0 && offset.is_multiple_of(MIB) {
+                    arrived.send(()).unwrap();
+                    wait.recv().unwrap();
                 }
-                a.install_channel(ca).unwrap();
-                b.install_channel(cb).unwrap();
+            };
+            (gate, go)
+        };
+        let (gate_a, go_a) = stop_at_each_mib();
+        let (gate_b, go_b) = stop_at_each_mib();
+        let data_a = test_data(4 * MIB, 3);
+        let data_b = test_data(4 * MIB, 4);
+        let got_b = exchange_gated(sock_a, data_a.clone(), gate_a);
+        let got_a = exchange_gated(sock_b, data_b.clone(), gate_b);
+        let (mut waiting, mut swaps) = (0, 0);
+        run_pair_with(&mut a, &mut b, &mut arrivals, |(), a, b| {
+            waiting += 1;
+            if waiting < 2 {
+                return;
             }
+            waiting = 0;
+            swaps += 1;
+            // Sometimes drop the old channel at one end before the other
+            // end swaps.
+            let (ca, cb) = channel_pair();
+            if swaps % 2 == 0 {
+                b.drop_channel();
+            }
+            a.install_channel(ca).unwrap();
+            b.install_channel(cb).unwrap();
+            go_a.send(()).unwrap();
+            go_b.send(()).unwrap();
         })
         .await;
-        assert!(swaps >= 3, "only {swaps} swaps");
+        assert_eq!(swaps, 3);
         assert!(got_a.join().unwrap() == data_a);
         assert!(got_b.join().unwrap() == data_b);
     });
@@ -205,7 +258,7 @@ fn unpollable_application_fds() {
         b.install_channel(cb).unwrap();
         let data_b = test_data(1 << 20, 5);
         let got_a = exchange(sock_b, data_b.clone());
-        run_pair(&mut a, &mut b, |_, _| {}).await;
+        run_pair(&mut a, &mut b).await;
         assert!(got_a.join().unwrap().is_empty());
         assert!(std::fs::read(&path).unwrap() == data_b);
     });
@@ -226,7 +279,7 @@ fn application_stops_reading() {
         sock_a.shutdown(Shutdown::Both).unwrap();
         drop(sock_a);
         let got = exchange(sock_b, test_data(1 << 20, 6));
-        run_pair(&mut a, &mut b, |_, _| {}).await;
+        run_pair(&mut a, &mut b).await;
         assert!(got.join().unwrap().is_empty());
     });
 }
@@ -300,7 +353,7 @@ fn serves_channel_after_finish() {
         // A sends 1000 bytes, B 2000.
         let at_a = exchange(sock_a, test_data(1000, 7));
         let at_b = exchange(sock_b, test_data(2000, 8));
-        run_pair(&mut a, &mut b, |_, _| {}).await;
+        run_pair(&mut a, &mut b).await;
         assert_eq!(at_a.join().unwrap().len(), 2000);
         assert_eq!(at_b.join().unwrap().len(), 1000);
         drop(b);
@@ -309,15 +362,13 @@ fn serves_channel_after_finish() {
         let ours = OwnedFd::from(ours);
         let ours2 = ours.try_clone().unwrap();
         a.install_channel(Channel::new(ours, ours2)).unwrap();
-        let reader = std::thread::spawn(move || {
+        let reader = in_thread(move || {
             let mut buf = [0u8; crate::frame::HEADER_LEN];
             (&theirs).read_exact(&mut buf).unwrap();
             (buf, theirs)
         });
         // No event while the channel is quiet.
-        let ev = tokio::time::timeout(Duration::from_millis(100), a.next_event()).await;
-        assert!(ev.is_err(), "{ev:?}");
-        let (buf, theirs) = reader.join().unwrap();
+        let (buf, theirs) = drive_until(&mut a, reader).await.unwrap();
         let h = crate::frame::FrameHeader::decode(&buf).unwrap();
         assert!(h.first);
         assert_eq!(h.ack, 2001, "acknowledges the peer's shutdown");
