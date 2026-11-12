@@ -38,9 +38,20 @@ fn test_data(len: usize, seed: u8) -> Vec<u8> {
 /// Writes `data` to `s` and then shuts down its write side; reads `s` to
 /// EOF in another thread. Returns the reader's result.
 fn exchange(s: UnixStream, data: Vec<u8>) -> JoinHandle<Vec<u8>> {
+    exchange_paced(s, data, Duration::ZERO)
+}
+
+/// Like [`exchange`], but pauses for `pause` after writing each 64 KiB, so
+/// that the transfer takes a known minimum time however fast the build.
+fn exchange_paced(s: UnixStream, data: Vec<u8>, pause: Duration) -> JoinHandle<Vec<u8>> {
     let mut w = s.try_clone().unwrap();
     std::thread::spawn(move || {
-        w.write_all(&data).unwrap();
+        for chunk in data.chunks(64 << 10) {
+            w.write_all(chunk).unwrap();
+            if !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
+        }
         w.shutdown(Shutdown::Write).unwrap();
     });
     let mut r = s;
@@ -148,8 +159,12 @@ fn swap_mid_transfer() {
 
         let data_a = test_data(4 << 20, 3);
         let data_b = test_data(4 << 20, 4);
-        let got_b = exchange(sock_a, data_a.clone());
-        let got_a = exchange(sock_b, data_b.clone());
+        // `run_pair` ticks every 5 ms and we swap at most once a tick, so
+        // pace the writers: unpaced, an optimized build moves all 8 MiB in a
+        // few ticks. Paced, it takes at least 64 ms (a dozen or more ticks).
+        let pause = Duration::from_millis(1);
+        let got_b = exchange_paced(sock_a, data_a.clone(), pause);
+        let got_a = exchange_paced(sock_b, data_b.clone(), pause);
         let mut swaps = 0;
         run_pair(&mut a, &mut b, |a, b| {
             // Swap every megabyte or so, sometimes dropping the old channel
