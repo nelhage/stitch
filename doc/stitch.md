@@ -135,6 +135,8 @@ We select this framing is chosen with the goals of:
 - **Textual/human-readable**: A nice-to-have, but as long as we're using JSON we keep the entire metadata packet as textual for human debugging.
 
 ## Edge cases
+Limits imposed by the environment `stitch` runs in (interactive authentication, server-side keepalives, `KillUserProcesses`) are described in [limitations.md](limitations.md).
+
 ### Connection shutdown
 We use an approach reminiscent of TCP FIN for shutdown.
 
