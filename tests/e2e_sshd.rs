@@ -12,6 +12,10 @@
 //! The tests are skipped (they pass, printing a message) if `sshd`, `ssh`
 //! or `ssh-keygen` cannot be found, or `sshd` cannot be started, unless
 //! `STITCH_E2E_REQUIRED` is set (as in CI), in which case they fail.
+//!
+//! Linux-only: the tests find and inspect processes through `/proc`.
+
+#![cfg(target_os = "linux")]
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};

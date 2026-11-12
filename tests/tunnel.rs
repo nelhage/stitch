@@ -1,6 +1,10 @@
 //! Process-level tests of `stitch tunnel` and the server, using a fake `ssh`
 //! (`tests/fake-ssh`) which runs the remote command locally. See "Testing"
 //! in `doc/implementation.md`.
+//!
+//! Linux-only: the tests find and inspect processes through `/proc`.
+
+#![cfg(target_os = "linux")]
 
 use std::fs;
 use std::io::{Read, Write};
