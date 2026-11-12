@@ -82,7 +82,10 @@ pub struct TunnelArgs {
 ///   within a short grace period; never while an attempt is outstanding.
 /// - Abandons (kills) an attempt with no reply within `connect_timeout` or
 ///   whose `ssh` exits first; retries back off exponentially from 1 s to 30 s,
-///   indefinitely. An `error` reply to a resume is fatal, unless we have
+///   indefinitely. A reply (to the open or a resume) of a protocol version
+///   we do not support is refused before any frame is exchanged, and is
+///   fatal in the same way as an `error` reply: retrying cannot change it.
+///   An `error` reply to a resume is fatal, unless we have
 ///   already received everything we need from the server (both shutdowns
 ///   are through); then we stop resuming, and finish delivering to stdout.
 /// - On success, kills the old `ssh` and swaps the channel.
@@ -135,6 +138,11 @@ fn ssh_args(args: &TunnelArgs) -> Vec<OsString> {
 /// in our process group and session all the same, since it must be able to
 /// prompt on the terminal. Its lifetime is ours to manage instead: it is
 /// killed when dropped, and should we die first, it sees EOF on its stdin.
+///
+/// The reply's version has been checked (by [`handshake::parse`]): a reply
+/// of a version we do not support is an error here, whose cause is a
+/// [`HandshakeError::UnsupportedVersion`], unless it is an `error` reply,
+/// which is returned as it is.
 async fn handshake(args: &TunnelArgs, msg: &Message) -> anyhow::Result<(Child, Channel, Message)> {
     let mut cmd = Command::new(&args.ssh);
     cmd.args(ssh_args(args))
@@ -180,6 +188,10 @@ enum AttemptError {
     /// The server replied with an error, or answered for a different
     /// session: our session is gone.
     Rejected(ErrorReply),
+    /// The server replied in a protocol version we do not support. Like a
+    /// rejection, this is permanent: neither end changes version by our
+    /// trying again.
+    Incompatible(anyhow::Error),
     /// Anything else, such as `ssh` failing or the attempt timing out.
     Failed(anyhow::Error),
 }
@@ -201,7 +213,10 @@ async fn resume_attempt(
             "no reply within {:?}",
             args.connect_timeout
         ))),
-        Ok(Err(e)) => Err(AttemptError::Failed(e)),
+        Ok(Err(e)) => Err(match e.downcast_ref::<HandshakeError>() {
+            Some(HandshakeError::UnsupportedVersion(_)) => AttemptError::Incompatible(e),
+            _ => AttemptError::Failed(e),
+        }),
         Ok(Ok((child, channel, reply))) => match reply {
             Message::Ok(ok) if ok.session == session => Ok((child, channel)),
             // Whatever answered at our socket is not our session, and
@@ -478,7 +493,21 @@ impl Client {
                     self.server_gone = true;
                     return Ok(());
                 }
+                if e.code == ErrorCode::UnsupportedVersion {
+                    // The session may well be there, but not for us.
+                    bail!("cannot resume the session: {}: {}", e.code, e.message)
+                }
                 bail!("remote session is gone: {}: {}", e.code, e.message)
+            }
+            Err(AttemptError::Incompatible(e)) => {
+                if self.all_received() {
+                    // As for a rejection: all we could still do is deliver
+                    // our final acknowledgement, and we cannot.
+                    log::info!("cannot resume the session ({e:#}), but everything was received");
+                    self.server_gone = true;
+                    return Ok(());
+                }
+                Err(e.context("cannot resume the session"))
             }
             Err(AttemptError::Failed(e)) => {
                 log::info!(

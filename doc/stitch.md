@@ -163,6 +163,7 @@ If the client attempts to resume, and discovers that the rendezvous socket is mi
     - Client initiates a connection to a newer or older server version
     - Server binary on-disk is upgraded, and server shim and a running server process are now different versions
     - Client connection lifetime is bound to the lifetime of a `stitch` process, so it's not possible for the client to change versions within the lifetime of a single connection.
+    - So far there is a single protocol version, and nothing is negotiated: each JSON setup message carries a version, and a client, shim or server process which receives a version other than its own refuses it there (the server side with a JSON error reply), rather than proceeding to exchange frames it may misinterpret. In particular, a running server process refuses a resume forwarded by a newer shim without disturbing its session. Supporting the cases above across a real version change is still open.
 - Local application closes its read side
     - If the local application closes the fd we deliver data to, while the peer is still sending, the receive buffer can never drain, and the peer would stall forever at a zero window.
     - The simplest answer is to discard incoming data from then on, while continuing to acknowledge it and advertise a full window. The alternative is an explicit "reset" signal which tells the peer to stop sending.

@@ -924,6 +924,200 @@ fn bad_resumes_are_rejected() {
     env.assert_cleaned_up();
 }
 
+/// Sends `msg` (a complete wire message) straight to the daemon listening
+/// on `socket`, as a shim would, and returns its reply.
+fn daemon_exchange(socket: &Path, msg: &[u8]) -> Message {
+    use std::os::fd::AsFd;
+    let conn = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    let (r, w_far) = nix::unistd::pipe().unwrap();
+    let (r_far, w) = nix::unistd::pipe().unwrap();
+    stitch::fdpass::send_with_fds(&conn, msg, &[r.as_fd(), w.as_fd()]).unwrap();
+    drop((r, w, w_far));
+    let (_, reply) = handshake::read_message(&mut fs::File::from(r_far)).unwrap();
+    reply
+}
+
+/// `msg`, as a wire message, with its `version` replaced.
+fn with_version(msg: &Message, version: u32) -> Vec<u8> {
+    let mut json: serde_json::Value = serde_json::from_slice(&msg.to_json()).unwrap();
+    json["version"] = version.into();
+    handshake::frame(json.to_string().as_bytes()).unwrap()
+}
+
+/// Checks that `reply` refuses protocol version 2, naming both versions.
+fn expect_unsupported_version(reply: Message) {
+    let Message::Error(e) = &reply else {
+        panic!("expected an error, got {reply:?}");
+    };
+    assert_eq!(e.code, ErrorCode::UnsupportedVersion, "{e:?}");
+    assert_eq!(e.code.as_str(), "unsupported_version");
+    assert!(e.message.contains("version 2 "), "{e:?}");
+    assert!(
+        e.message
+            .contains(&format!("only version {}", handshake::VERSION)),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn open_with_unsupported_version_is_refused() {
+    // A newer client must be refused in the handshake, where it can be
+    // told why, and not once frames it would send differently are flowing.
+    let env = Env::new();
+    let open = Message::open(
+        1000,
+        handshake::Target::Command {
+            command: "cat".into(),
+        },
+    );
+    let (reply, status) = shim_exchange(&env, &with_version(&open, 2));
+    expect_unsupported_version(reply);
+    assert!(!status.success(), "{status}");
+    // Even if the newer version's open looks nothing like ours.
+    let json = br#"{"type":"open","version":2,"streams":[]}"#;
+    let (reply, status) = shim_exchange(&env, &handshake::frame(json).unwrap());
+    expect_unsupported_version(reply);
+    assert!(!status.success(), "{status}");
+    // No session was started for it.
+    assert!(env.daemons().is_empty());
+    assert!(env.sockets().is_empty(), "{:?}", env.sockets());
+}
+
+#[test]
+fn resume_with_unsupported_version_is_refused() {
+    // E.g. the binary on the server was upgraded under a running session:
+    // a resume in a version the daemon does not speak must be refused in
+    // the handshake, leaving the session and its channel alone.
+    let env = Env::new();
+    let (port, server) = echo_server();
+    let mut t = env.tunnel(&[&format!("127.0.0.1:{port}")]);
+    let mut stdin = t.stdin.take().unwrap();
+    let mut stdout = t.stdout.take().unwrap();
+    stdin.write_all(b"one").unwrap();
+    assert_eq!(read_n(&mut stdout, 3), b"one");
+
+    let socket = env.sockets().pop().unwrap();
+    let id = socket.file_stem().unwrap().to_str().unwrap().to_owned();
+    // Otherwise acceptable: our session, and the next epoch.
+    let resume = with_version(&Message::resume(&id, &socket, 1), 2);
+    // Refused by the shim...
+    let (reply, status) = shim_exchange(&env, &resume);
+    expect_unsupported_version(reply);
+    assert!(!status.success(), "{status}");
+    // ... and by the daemon, should a (newer) shim forward it.
+    expect_unsupported_version(daemon_exchange(&socket, &resume));
+    let json = format!(r#"{{"type":"resume","version":2,"session":"{id}","token":"x"}}"#);
+    let unlike_ours = handshake::frame(json.as_bytes()).unwrap();
+    expect_unsupported_version(daemon_exchange(&socket, &unlike_ours));
+    wait_for_server_log(&env, "unsupported_version");
+
+    // The session carries on, on the channel it had.
+    stdin.write_all(b"two").unwrap();
+    assert_eq!(read_n(&mut stdout, 3), b"two");
+    assert_eq!(env.invocations().len(), 1);
+    assert!(!server_log(&env).contains("resuming"));
+
+    // And it can still be resumed: the refused resumes did not use up
+    // epoch 1, which is what the client sends next.
+    env.break_connection(&env.invocation(0));
+    stdin.write_all(b"three").unwrap();
+    assert_eq!(read_n(&mut stdout, 5), b"three");
+    wait_for_server_log(&env, "resuming on epoch 1");
+    drop(stdin);
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"");
+    assert!(t.wait().success());
+    assert_eq!(server.join().unwrap(), 11);
+    assert_eq!(env.invocations().len(), 2);
+    env.assert_cleaned_up();
+}
+
+/// Writes a stand-in for the remote `stitch` which answers with `reply`
+/// (the JSON of a handshake message): to every request, or, with
+/// `after_open`, only once the real `stitch` has served the open.
+fn canned_remote(env: &Env, reply: &str, after_open: bool) -> PathBuf {
+    assert!(!reply.contains('\''));
+    let remote = env.path("remote");
+    let script = format!(
+        r#"#!/bin/sh
+if [ -z "{after_open}" ] || [ -e "{dir}/opened" ]; then
+    msg='{reply}'
+    printf '%08x%s' ${{#msg}} "$msg"
+    exec sleep 30
+fi
+touch "{dir}/opened"
+exec {stitch} "$@"
+"#,
+        after_open = if after_open { "1" } else { "" },
+        dir = env.dir.path().display(),
+        stitch = STITCH,
+    );
+    fs::write(&remote, script).unwrap();
+    fs::set_permissions(&remote, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    remote
+}
+
+const OK_V2: &str =
+    r#"{"type":"ok","version":2,"session":"0123456789abcdef0123456789abcdef","socket":"/x"}"#;
+
+#[test]
+fn client_refuses_open_reply_with_unsupported_version() {
+    let env = Env::new();
+    let remote = canned_remote(&env, OK_V2, false);
+    let mut t = env.tunnel_with(&["--", "cat"], |cmd| {
+        cmd.env("STITCH_REMOTE", &remote);
+    });
+    let status = t.wait();
+    assert!(!status.success(), "{status}");
+    let log = client_log(&env);
+    assert!(log.contains("cannot open the session"), "{log}");
+    assert!(log.contains("unsupported protocol version 2"), "{log}");
+    assert!(!log.contains("opened session"), "{log}");
+}
+
+#[test]
+fn client_reports_error_reply_of_another_version() {
+    // A newer server refusing us says so in an `error` of its own version;
+    // the client must report that error, not the version it came in.
+    let env = Env::new();
+    let reply = r#"{"type":"error","version":2,"code":"unsupported_version","message":"this server needs version 2"}"#;
+    let remote = canned_remote(&env, reply, false);
+    let mut t = env.tunnel_with(&["--", "cat"], |cmd| {
+        cmd.env("STITCH_REMOTE", &remote);
+    });
+    let status = t.wait();
+    assert!(!status.success(), "{status}");
+    let log = client_log(&env);
+    assert!(
+        log.contains("unsupported_version: this server needs version 2"),
+        "{log}"
+    );
+}
+
+#[test]
+fn client_refuses_resume_reply_with_unsupported_version() {
+    // Unlike a garbled reply, this cannot be cured by trying again: the
+    // client gives up at once, rather than retrying forever.
+    let env = Env::new();
+    let remote = canned_remote(&env, OK_V2, true);
+    let mut t = env.tunnel_with(&["--", "cat"], |cmd| {
+        cmd.env("STITCH_REMOTE", &remote);
+    });
+    let mut stdin = t.stdin.take().unwrap();
+    let mut stdout = t.stdout.take().unwrap();
+    stdin.write_all(b"ping").unwrap();
+    assert_eq!(read_n(&mut stdout, 4), b"ping");
+    env.break_connection(&env.invocation(0));
+    let status = t.wait();
+    assert!(!status.success(), "{status}");
+    let log = client_log(&env);
+    assert!(log.contains("cannot resume the session"), "{log}");
+    assert!(log.contains("unsupported protocol version 2"), "{log}");
+    assert!(!log.contains("retrying"), "{log}");
+    assert_eq!(env.invocations().len(), 2);
+}
+
 #[test]
 fn stdin_from_dev_null() {
     let env = Env::new();
