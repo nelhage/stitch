@@ -12,38 +12,23 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 use nix::sys::signal;
 use tokio::process::{Child, Command};
 use tokio::signal::unix::{Signal, SignalKind, signal as signal_stream};
-use tokio::time::Instant;
 
 use crate::core::Config;
 use crate::handshake::{self, ErrorCode, ErrorReply, HandshakeError, Message, Target};
 use crate::runtime::{App, Channel, Event, Pump};
 
-/// Delay before retrying after the first failed resume attempt; it doubles
-/// with each further failure, up to [`MAX_BACKOFF`].
-const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-
-/// The longest delay between resume attempts.
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+mod policy;
+use policy::{HANGUP_TIMEOUT, ResumePolicy};
 
 /// How long to wait for `ssh` to exit by itself once the session has
 /// finished, before killing it.
 const EXIT_WAIT: Duration = Duration::from_secs(3);
-
-/// How long we allow the session to finish after `SIGHUP`, before giving
-/// up on it.
-const HANGUP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long the channel may outlive the active `ssh` before we treat it as
-/// lost. An `ssh` normally exits only after writing everything it received
-/// to the channel, so we keep reading until EOF; this bounds the wait in
-/// case some other process (a child of `ssh`, say) holds the channel open.
-const SSH_EXIT_GRACE: Duration = Duration::from_millis(1500);
 
 /// Fully-resolved configuration for `stitch tunnel`, produced by the CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,7 +230,7 @@ async fn poll_opt<F: Future + Unpin>(fut: Option<&mut F>) -> F::Output {
 /// Sleeps until `at`, or forever if it is `None`.
 async fn sleep_opt(at: Option<Instant>) {
     match at {
-        Some(t) => tokio::time::sleep_until(t).await,
+        Some(t) => tokio::time::sleep_until(t.into()).await,
         None => std::future::pending().await,
     }
 }
@@ -253,25 +238,21 @@ async fn sleep_opt(at: Option<Instant>) {
 /// The `ssh` process carrying the current channel.
 struct ActiveSsh {
     child: Child,
-    /// When the process was seen to exit.
-    exited_at: Option<Instant>,
+    /// Whether the process has been seen to exit.
+    exited: bool,
 }
 
 impl ActiveSsh {
     fn new(child: Child) -> ActiveSsh {
         ActiveSsh {
             child,
-            exited_at: None,
+            exited: false,
         }
-    }
-
-    fn exited(&self) -> bool {
-        self.exited_at.is_some()
     }
 
     /// Waits for the process to exit, or forever if it already has.
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        if self.exited() {
+        if self.exited {
             std::future::pending().await
         } else {
             self.child.wait().await
@@ -290,19 +271,11 @@ struct Client {
     attempt: Option<Pin<Box<dyn Future<Output = AttemptResult>>>>,
     /// The epoch of the most recent resume attempt (the open is epoch 0).
     epoch: u64,
-    /// The delay before the next attempt, should the current one fail.
-    backoff: Duration,
-    /// When the next attempt may start, after a failure.
-    retry_at: Option<Instant>,
-    /// The server rejected a resume after we had received everything we
-    /// need from it (see [`Client::all_received`]): there is no point in
-    /// trying again, so we just finish delivering to the application.
-    server_gone: bool,
+    /// When to resume, and when to give up.
+    policy: ResumePolicy,
     /// `SIGHUP`: `ssh` sends it to its `ProxyCommand` as it exits, and a
     /// terminal which goes away sends it to its foreground process group.
     hangup: Signal,
-    /// After `SIGHUP`, when we give up on finishing the session.
-    hangup_deadline: Option<Instant>,
 }
 
 impl Client {
@@ -345,32 +318,12 @@ impl Client {
             active: ActiveSsh::new(child),
             attempt: None,
             epoch: 0,
-            backoff: INITIAL_BACKOFF,
-            retry_at: None,
-            server_gone: false,
+            policy: ResumePolicy::new(),
             hangup,
-            hangup_deadline: None,
         };
         let result = client.main_loop().await;
         client.shutdown().await;
         result
-    }
-
-    /// Whether the current channel needs replacing: a resume trigger. The
-    /// exit of the active `ssh` counts only once the channel has outlived it
-    /// by [`SSH_EXIT_GRACE`]; until then, we keep reading what it wrote.
-    fn channel_broken(&self) -> bool {
-        !self.pump.has_channel()
-            || self.pump.timed_out()
-            || self
-                .ssh_exit_deadline()
-                .is_some_and(|t| t <= Instant::now())
-    }
-
-    /// When the exit of the active `ssh` becomes a resume trigger, if it has
-    /// exited.
-    fn ssh_exit_deadline(&self) -> Option<Instant> {
-        self.active.exited_at.map(|t| t + SSH_EXIT_GRACE)
     }
 
     /// Whether we need nothing more from the server: it has acknowledged
@@ -386,6 +339,7 @@ impl Client {
     }
 
     fn start_attempt(&mut self) {
+        self.policy.attempt_started();
         self.epoch += 1;
         log::info!("reconnecting (epoch {})", self.epoch);
         self.attempt = Some(Box::pin(resume_attempt(
@@ -398,22 +352,17 @@ impl Client {
 
     async fn main_loop(&mut self) -> anyhow::Result<i32> {
         loop {
-            // Resume triggers are level-triggered, but only act when no
-            // attempt is outstanding and no backoff delay is pending.
-            if self.attempt.is_none()
-                && self.retry_at.is_none()
-                && !self.server_gone
-                && self.channel_broken()
+            let now = Instant::now();
+            self.policy.handle_timeout(now);
+            if self.policy.hangup_expired(now) {
+                bail!("hung up, and the session did not finish within {HANGUP_TIMEOUT:?}");
+            }
+            if self
+                .policy
+                .should_attempt(now, !self.pump.has_channel(), self.pump.timed_out())
             {
                 self.start_attempt();
             }
-            // Once the active ssh's grace period runs out, wake up to
-            // re-evaluate the triggers (only if they are being evaluated, and
-            // only once).
-            let grace_end = self
-                .ssh_exit_deadline()
-                .filter(|&t| t > Instant::now())
-                .filter(|_| self.attempt.is_none() && self.retry_at.is_none());
             tokio::select! {
                 ev = self.pump.next_event() => match ev {
                     Event::Finished { flushed } => {
@@ -432,7 +381,8 @@ impl Client {
                     Event::TimedOut => log::info!("no traffic for {:?}", self.args.timeout),
                 },
                 status = self.active.wait() => {
-                    self.active.exited_at = Some(Instant::now());
+                    self.active.exited = true;
+                    self.policy.ssh_exited(Instant::now());
                     match status {
                         Ok(s) => log::info!("ssh exited: {s}"),
                         Err(e) => log::info!("waiting for ssh: {e}"),
@@ -442,16 +392,12 @@ impl Client {
                     self.attempt = None;
                     self.attempt_done(r)?;
                 }
-                () = sleep_opt(self.retry_at), if self.attempt.is_none() => {
-                    self.retry_at = None;
-                }
-                () = sleep_opt(grace_end) => {}
-                _ = self.hangup.recv(), if self.hangup_deadline.is_none() => {
+                // A backoff delay or grace period ended, or the hangup
+                // deadline passed: re-evaluate.
+                () = sleep_opt(self.policy.poll_timeout()) => {}
+                _ = self.hangup.recv(), if !self.policy.hung_up() => {
                     log::info!("hung up; finishing the session");
-                    self.hangup_deadline = Some(Instant::now() + HANGUP_TIMEOUT);
-                }
-                () = sleep_opt(self.hangup_deadline) => {
-                    bail!("hung up, and the session did not finish within {HANGUP_TIMEOUT:?}");
+                    self.policy.hangup(Instant::now());
                 }
             }
         }
@@ -469,15 +415,14 @@ impl Client {
                     )));
                 }
                 log::info!("reconnected (epoch {})", self.epoch);
+                self.policy.attempt_succeeded();
                 let mut old = std::mem::replace(&mut self.active, ActiveSsh::new(child));
-                if !old.exited() {
+                if !old.exited {
                     let _ = old.child.start_kill();
                     tokio::spawn(async move {
                         let _ = old.child.wait().await;
                     });
                 }
-                self.backoff = INITIAL_BACKOFF;
-                self.retry_at = None;
                 Ok(())
             }
             Err(AttemptError::Rejected(e)) => {
@@ -490,7 +435,7 @@ impl Client {
                         "the server session has gone ({}), but everything was received",
                         e.code
                     );
-                    self.server_gone = true;
+                    self.policy.server_gone();
                     return Ok(());
                 }
                 if e.code == ErrorCode::UnsupportedVersion {
@@ -504,18 +449,14 @@ impl Client {
                     // As for a rejection: all we could still do is deliver
                     // our final acknowledgement, and we cannot.
                     log::info!("cannot resume the session ({e:#}), but everything was received");
-                    self.server_gone = true;
+                    self.policy.server_gone();
                     return Ok(());
                 }
                 Err(e.context("cannot resume the session"))
             }
             Err(AttemptError::Failed(e)) => {
-                log::info!(
-                    "reconnect attempt failed: {e:#}; retrying in {:?}",
-                    self.backoff
-                );
-                self.retry_at = Some(Instant::now() + self.backoff);
-                self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+                let delay = self.policy.attempt_failed(Instant::now());
+                log::info!("reconnect attempt failed: {e:#}; retrying in {delay:?}");
                 Ok(())
             }
         }
@@ -532,7 +473,7 @@ impl Client {
         } = self;
         drop(pump);
         drop(attempt);
-        if !active.exited()
+        if !active.exited
             && tokio::time::timeout(EXIT_WAIT, active.child.wait())
                 .await
                 .is_err()
