@@ -5,7 +5,7 @@ use std::os::fd::RawFd;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::bail;
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 
 use crate::client::TunnelArgs;
@@ -161,9 +161,9 @@ impl TunnelOpts {
             Some(suffix) => strip_host_suffix(&self.host, suffix),
             None => &self.host,
         };
-        if host.is_empty() {
-            bail!("empty host name {:?}", self.host);
-        }
+        // Before anything is run: the host becomes an argument to `ssh`.
+        target::validate_ssh_host(host)
+            .with_context(|| format!("cannot use host {:?}", self.host))?;
         let target = if !self.command.is_empty() {
             Target::Command {
                 command: self.command.join(" "),
@@ -461,6 +461,35 @@ mod tests {
         assert!(tunnel(&["tunnel", "--strip-suffix", ".stitch", ".stitch"]).is_err());
         assert_eq!(strip_host_suffix("é", "x"), "é");
         assert_eq!(strip_host_suffix("aé", "\u{e9}"), "a");
+    }
+
+    #[test]
+    fn tunnel_rejects_unsafe_hosts() {
+        for args in [
+            &["tunnel", ""][..],
+            &["tunnel", "*.stitch"],
+            &["tunnel", "--strip-suffix", ".stitch", "*.stitch"],
+            &[
+                "tunnel",
+                "--strip-suffix",
+                ".stitch",
+                "-oProxyCommand=x.stitch",
+            ],
+            &["tunnel", "a b"],
+            &["tunnel", "a;b"],
+            &["tunnel", "$(id)"],
+            &["tunnel", "user@ho*st"],
+            &["tunnel", "host\n"],
+        ] {
+            assert!(tunnel(args).is_err(), "{args:?}");
+        }
+        let err = tunnel(&["tunnel", "--strip-suffix", ".stitch", "*.stitch"]).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("*.stitch") && err.contains("'*'"), "{err}");
+
+        for host in ["user@example.com", "::1", "fe80::1%eth0", "192.0.2.1"] {
+            assert_eq!(tunnel(&["tunnel", host]).unwrap().host, host);
+        }
     }
 
     #[test]

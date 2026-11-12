@@ -638,6 +638,91 @@ fn open_failures() {
     assert!(client.contains("cannot open the session"), "{client}");
 }
 
+/// A host name which is a glob matching a file whose name looks like an
+/// option cannot inject that option into the `ssh` which `stitch tunnel`
+/// runs: the generated `ProxyCommand`s quote `%h`, so the shell which runs
+/// them does not expand it, and `stitch tunnel` then refuses such a host
+/// without running `ssh`.
+#[test]
+fn host_cannot_inject_ssh_options() {
+    let env = Env::new();
+    // A stand-in for ssh which records that, and how, it was run.
+    let ran = env.path("ssh-ran");
+    let recorder = env.path("record-ssh");
+    fs::write(
+        &recorder,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", ran.display()),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&recorder).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(&recorder, perms).unwrap();
+
+    // The planted files: `*.stitch` matches both, and the first, unquoted,
+    // is `-oProxyCommand=...` to `stitch tunnel`, which passes `-o` options
+    // on to ssh.
+    let cwd = env.path("cwd");
+    fs::create_dir(&cwd).unwrap();
+    fs::write(cwd.join("-oProxyCommand=sh payload.sh;.stitch"), "").unwrap();
+    fs::write(cwd.join("a.stitch"), "").unwrap();
+
+    // Run a ProxyCommand as ssh does, for the host `*.stitch`: `%`-tokens
+    // expanded, then `$SHELL -c "exec <command>"`.
+    let run = |proxy_command: &str| {
+        let _ = fs::remove_file(&ran);
+        let expanded = proxy_command.replace("%h", "*.stitch");
+        let out = Command::new("sh")
+            .env("STITCH_SSH", &recorder)
+            .env("XDG_RUNTIME_DIR", env.dir.path())
+            .current_dir(&cwd)
+            .arg("-c")
+            .arg(format!("exec {expanded}"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (
+            out.status,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            fs::read_to_string(&ran).ok(),
+        )
+    };
+
+    // Quoted, as `stitch ssh-config` and `stitch ssh` write it: the host is
+    // the literal `*.stitch`, which is refused, and ssh is never run.
+    let (status, stderr, ssh) = run(&format!("{STITCH} tunnel --strip-suffix .stitch '%h'"));
+    assert!(!status.success());
+    assert!(stderr.contains("invalid host name"), "{stderr}");
+    assert_eq!(ssh, None, "{stderr}");
+
+    // A control, to show that the above tests something: unquoted, as older
+    // versions wrote it, the shell expands the glob, and the planted name
+    // arrives as an option (with `a.stitch` as an unobjectionable host).
+    // Nothing `stitch tunnel` checks about the host can help with that; the
+    // quoting is the fix, and `stitch ssh-config` must be re-run to get it.
+    let (_, stderr, ssh) = run(&format!("{STITCH} tunnel --strip-suffix .stitch %h"));
+    let ssh = ssh.unwrap_or_default();
+    assert!(
+        ssh.contains("ProxyCommand=sh payload.sh"),
+        "stderr: {stderr}; ssh args: {ssh}"
+    );
+
+    // Given directly, a host which could be an option or contains a glob
+    // is refused before ssh is run.
+    for host in ["*.stitch", "-Thost", "a b", "$(id)"] {
+        let _ = fs::remove_file(&ran);
+        let out = env
+            .command()
+            .env("STITCH_SSH", &recorder)
+            .current_dir(&cwd)
+            .args(["tunnel", "--strip-suffix", ".stitch", host])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{host:?}");
+        assert!(!ran.exists(), "{host:?}");
+    }
+}
+
 /// Runs the shim directly, sending it `msg` (raw bytes), and returns its
 /// reply and exit status.
 fn shim_exchange(env: &Env, msg: &[u8]) -> (Message, ExitStatus) {

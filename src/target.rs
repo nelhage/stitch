@@ -1,5 +1,6 @@
 //! Parsing of the tunnel destination argument `[[<DEST>:]<PORT>]`, and of
-//! `SSH_CONNECTION` (used on the server to find its own `sshd` port).
+//! `SSH_CONNECTION` (used on the server to find its own `sshd` port), and
+//! validation of the host `stitch tunnel` runs `ssh` to.
 
 use std::fmt;
 
@@ -20,6 +21,48 @@ pub enum TargetError {
     NoSshConnection,
     #[error("cannot parse SSH_CONNECTION {0:?}")]
     BadSshConnection(String),
+    #[error("empty host name")]
+    EmptySshHost,
+    #[error("invalid host name {0:?}: it must not start with `-`")]
+    SshHostIsOption(String),
+    #[error("invalid host name {0:?}: it must not contain {1:?}")]
+    BadSshHostChar(String, char),
+}
+
+/// Characters which may not appear in the host `stitch tunnel` runs `ssh` to:
+/// those which a shell treats specially (quoting, expansion, globbing,
+/// control operators, redirection, comments).
+const SHELL_METACHARACTERS: &str = "*?[]{}~$`'\"\\;&|<>()!#^";
+
+/// Check the host which `stitch tunnel` passes to `ssh` (`HOST`, or
+/// `USER@HOST`; IPv6 literals are written without brackets, as `ssh` takes
+/// them, possibly with a `%zone`).
+///
+/// The host usually arrives through an `ssh` `ProxyCommand`, which `ssh`
+/// runs with the user's shell after substituting `%h` textually, and is then
+/// handed to another `ssh` as an argument. Reject one which is empty, starts
+/// with `-` (which `ssh` would take as an option), or contains whitespace,
+/// control characters, or shell metacharacters; no real host name or address
+/// needs any of those, and one which has them is at best a mistake.
+///
+/// This is a second line of defence only. It cannot make a `ProxyCommand`
+/// which does not quote `%h` safe: there, the shell has already acted on the
+/// host name before `stitch` sees any of it, and what a glob expands to may
+/// arrive as an option rather than as the host.
+pub fn validate_ssh_host(host: &str) -> Result<(), TargetError> {
+    if host.is_empty() {
+        return Err(TargetError::EmptySshHost);
+    }
+    if host.starts_with('-') {
+        return Err(TargetError::SshHostIsOption(host.to_owned()));
+    }
+    match host
+        .chars()
+        .find(|&c| c.is_whitespace() || c.is_control() || SHELL_METACHARACTERS.contains(c))
+    {
+        Some(c) => Err(TargetError::BadSshHostChar(host.to_owned(), c)),
+        None => Ok(()),
+    }
 }
 
 /// A parsed `[<DEST>:]<PORT>`.
@@ -167,6 +210,75 @@ mod tests {
             parse_destination("::1:22"),
             Err(TargetError::UnbracketedIpv6(_))
         ));
+    }
+
+    #[test]
+    fn valid_ssh_hosts() {
+        for s in [
+            "host",
+            "example.com",
+            "Example.COM.",
+            "user@example.com",
+            "first.last+tag@host_1",
+            "192.0.2.1",
+            "::1",
+            "me@fe80::1%eth0",
+            "b\u{fc}cher.example",
+            "a-b",
+            "a=b,c:d/e",
+        ] {
+            assert_eq!(validate_ssh_host(s), Ok(()), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_ssh_hosts() {
+        assert_eq!(validate_ssh_host(""), Err(TargetError::EmptySshHost));
+        for s in ["-", "-oProxyCommand=x", "--ssh-option=x", "-host"] {
+            assert!(
+                matches!(validate_ssh_host(s), Err(TargetError::SshHostIsOption(_))),
+                "{s:?}"
+            );
+        }
+        for s in [
+            "*",
+            "*.example.com",
+            "ho?t",
+            "h[ao]st",
+            "[::1]",
+            "{a,b}",
+            "~",
+            "~user",
+            "$HOME",
+            "`id`",
+            "$(id)",
+            "a b",
+            " host",
+            "host\t",
+            "host\n",
+            "a\rb",
+            "a\0b",
+            "a\u{1b}b",
+            "a\u{a0}b",
+            "a\u{2028}b",
+            "it's",
+            "\"host\"",
+            "a\\b",
+            "a;b",
+            "a&b",
+            "a|b",
+            "a<b",
+            "a>b",
+            "a!b",
+            "#host",
+            "a^b",
+            "user@-oProxyCommand=sh x;",
+        ] {
+            assert!(
+                matches!(validate_ssh_host(s), Err(TargetError::BadSshHostChar(..))),
+                "{s:?}"
+            );
+        }
     }
 
     #[test]

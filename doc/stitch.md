@@ -19,7 +19,8 @@ The primary use case for a `stitch` stream is to run **another** "ssh" instance 
 - The connection is proxied via one or more `ssh` connections to `<HOST>`. In common use, `<HOST>` and `<DEST>` will either be identical, or `<DEST>` may be `localhost`, such that you are connecting to `HOST` via itself.
     - However, setting `HOST` and `DEST` to distinct addresses can be useful in order to use `HOST` as a jump box or bastion to reach `DEST`
 - In order to achieve a stable `ssh` connection, `stitch tunnel` can be used as an ssh `ProxyCommand`
-    - e.g. `ssh HOST -o ProxyCommand="stitch tunnel %h 127.0.0.1:%p"`
+    - e.g. `ssh HOST -o ProxyCommand="stitch tunnel '%h' 127.0.0.1:%p"`
+    - `ssh` runs a `ProxyCommand` with the user's shell, so `%h` must be quoted, or the shell will split and glob-expand the host name. Separately, `stitch tunnel` refuses a `HOST` which is empty, starts with `-`, or contains whitespace, control characters or shell metacharacters.
 - `stitch ssh HOST` will invoke `ssh` with `stitch` as an appropriate `ProxyCommand` and set various other `ssh` configuration options to establish a reliable tunnel.
 - `stitch tunnel` and `stitch ssh` both accept `--remote-stitch=CMD`, giving the `stitch` command to run on the remote host (e.g. a path to the binary), instead of relying on the remote `PATH`. Like `rsync --rsync-path` or `xpra --remote-xpra`, it is interpreted by the remote shell.
 - `stitch ssh-config` will set up `ssh` configuration such that `ssh HOST.stitch` will work for arbitrary `HOST`
