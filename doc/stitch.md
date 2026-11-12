@@ -19,7 +19,8 @@ The primary use case for a `stitch` stream is to run **another** "ssh" instance 
 - The connection is proxied via one or more `ssh` connections to `<HOST>`. In common use, `<HOST>` and `<DEST>` will either be identical, or `<DEST>` may be `localhost`, such that you are connecting to `HOST` via itself.
     - However, setting `HOST` and `DEST` to distinct addresses can be useful in order to use `HOST` as a jump box or bastion to reach `DEST`
 - In order to achieve a stable `ssh` connection, `stitch tunnel` can be used as an ssh `ProxyCommand`
-    - e.g. `ssh HOST -o ProxyCommand="stitch tunnel %h 127.0.0.1:%p"`
+    - e.g. `ssh HOST -o ProxyCommand="stitch tunnel '%h' 127.0.0.1:%p"`
+    - `ssh` runs a `ProxyCommand` with the user's shell, so `%h` must be quoted, or the shell will split and glob-expand the host name. Separately, `stitch tunnel` refuses a `HOST` which is empty, starts with `-`, or contains whitespace, control characters or shell metacharacters.
 - `stitch ssh HOST` will invoke `ssh` with `stitch` as an appropriate `ProxyCommand` and set various other `ssh` configuration options to establish a reliable tunnel.
 - `stitch tunnel` and `stitch ssh` both accept `--remote-stitch=CMD`, giving the `stitch` command to run on the remote host (e.g. a path to the binary), instead of relying on the remote `PATH`. Like `rsync --rsync-path` or `xpra --remote-xpra`, it is interpreted by the remote shell.
 - `stitch ssh-config` will set up `ssh` configuration such that `ssh HOST.stitch` will work for arbitrary `HOST`
@@ -135,6 +136,8 @@ We select this framing is chosen with the goals of:
 - **Textual/human-readable**: A nice-to-have, but as long as we're using JSON we keep the entire metadata packet as textual for human debugging.
 
 ## Edge cases
+Limits imposed by the environment `stitch` runs in (interactive authentication, server-side keepalives, `KillUserProcesses`) are described in [limitations.md](limitations.md).
+
 ### Connection shutdown
 We use an approach reminiscent of TCP FIN for shutdown.
 
@@ -160,6 +163,7 @@ If the client attempts to resume, and discovers that the rendezvous socket is mi
     - Client initiates a connection to a newer or older server version
     - Server binary on-disk is upgraded, and server shim and a running server process are now different versions
     - Client connection lifetime is bound to the lifetime of a `stitch` process, so it's not possible for the client to change versions within the lifetime of a single connection.
+    - So far there is a single protocol version, and nothing is negotiated: each JSON setup message carries a version, and a client, shim or server process which receives a version other than its own refuses it there (the server side with a JSON error reply), rather than proceeding to exchange frames it may misinterpret. In particular, a running server process refuses a resume forwarded by a newer shim without disturbing its session. Supporting the cases above across a real version change is still open.
 - Local application closes its read side
     - If the local application closes the fd we deliver data to, while the peer is still sending, the receive buffer can never drain, and the peer would stall forever at a zero window.
     - The simplest answer is to discard incoming data from then on, while continuing to acknowledge it and advertise a full window. The alternative is an explicit "reset" signal which tells the peer to stop sending.

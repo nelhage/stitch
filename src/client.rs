@@ -15,8 +15,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
+use nix::sys::signal;
 use tokio::process::{Child, Command};
-use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal as signal_stream};
 use tokio::time::Instant;
 
 use crate::core::Config;
@@ -81,16 +82,22 @@ pub struct TunnelArgs {
 ///   within a short grace period; never while an attempt is outstanding.
 /// - Abandons (kills) an attempt with no reply within `connect_timeout` or
 ///   whose `ssh` exits first; retries back off exponentially from 1 s to 30 s,
-///   indefinitely. An `error` reply to a resume is fatal, unless we have
+///   indefinitely. A reply (to the open or a resume) of a protocol version
+///   we do not support is refused before any frame is exchanged, and is
+///   fatal in the same way as an `error` reply: retrying cannot change it.
+///   An `error` reply to a resume is fatal, unless we have
 ///   already received everything we need from the server (both shutdowns
 ///   are through); then we stop resuming, and finish delivering to stdout.
 /// - On success, kills the old `ssh` and swaps the channel.
 /// - When the session finishes, flushes, closes the channel, waits briefly
 ///   for `ssh` to exit (killing it otherwise), and returns `Ok(0)`.
-/// - `SIGHUP` (which `ssh` sends its `ProxyCommand` as it exits) does not
-///   kill the process: the session carries on until it finishes (normally
-///   at once, since stdin and stdout have been closed too), for up to
-///   10 s.
+/// - `SIGHUP` does not kill the process: the session carries on until it
+///   finishes (normally at once, since stdin and stdout have been closed
+///   too), for up to 10 s. It comes from `ssh`, which sends it to its
+///   `ProxyCommand` as it exits, or from the terminal going away, which
+///   sends it to the whole foreground process group: our `ssh` runs with
+///   `SIGHUP` ignored, so that the channel survives that to carry the end
+///   of the session.
 pub fn run_tunnel(args: TunnelArgs) -> anyhow::Result<i32> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -121,6 +128,21 @@ fn ssh_args(args: &TunnelArgs) -> Vec<OsString> {
 /// Runs `ssh` to the host, sends `msg` to the shim, and reads its reply.
 /// Returns the `ssh` process, the channel (its stdout and stdin), and the
 /// reply.
+///
+/// The `ssh` runs with `SIGHUP` ignored (which OpenSSH respects: it leaves
+/// an ignored `SIGHUP` alone). It shares our process group, so when the
+/// terminal goes away it is sent `SIGHUP` along with us; if that killed
+/// it, we could only finish the session (see [`HANGUP_TIMEOUT`]) by logging
+/// in again, within seconds and with no terminal to authenticate on, and
+/// failing that would leave the server's session waiting forever. It stays
+/// in our process group and session all the same, since it must be able to
+/// prompt on the terminal. Its lifetime is ours to manage instead: it is
+/// killed when dropped, and should we die first, it sees EOF on its stdin.
+///
+/// The reply's version has been checked (by [`handshake::parse`]): a reply
+/// of a version we do not support is an error here, whose cause is a
+/// [`HandshakeError::UnsupportedVersion`], unless it is an `error` reply,
+/// which is returned as it is.
 async fn handshake(args: &TunnelArgs, msg: &Message) -> anyhow::Result<(Child, Channel, Message)> {
     let mut cmd = Command::new(&args.ssh);
     cmd.args(ssh_args(args))
@@ -128,6 +150,14 @@ async fn handshake(args: &TunnelArgs, msg: &Message) -> anyhow::Result<(Child, C
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    // SAFETY: the closure runs between `fork` and `exec`, and makes only an
+    // async-signal-safe call (`signal`).
+    unsafe {
+        cmd.pre_exec(|| {
+            signal::signal(signal::Signal::SIGHUP, signal::SigHandler::SigIgn)?;
+            Ok(())
+        });
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("cannot run {}", args.ssh.to_string_lossy()))?;
@@ -158,6 +188,10 @@ enum AttemptError {
     /// The server replied with an error, or answered for a different
     /// session: our session is gone.
     Rejected(ErrorReply),
+    /// The server replied in a protocol version we do not support. Like a
+    /// rejection, this is permanent: neither end changes version by our
+    /// trying again.
+    Incompatible(anyhow::Error),
     /// Anything else, such as `ssh` failing or the attempt timing out.
     Failed(anyhow::Error),
 }
@@ -179,7 +213,10 @@ async fn resume_attempt(
             "no reply within {:?}",
             args.connect_timeout
         ))),
-        Ok(Err(e)) => Err(AttemptError::Failed(e)),
+        Ok(Err(e)) => Err(match e.downcast_ref::<HandshakeError>() {
+            Some(HandshakeError::UnsupportedVersion(_)) => AttemptError::Incompatible(e),
+            _ => AttemptError::Failed(e),
+        }),
         Ok(Ok((child, channel, reply))) => match reply {
             Message::Ok(ok) if ok.session == session => Ok((child, channel)),
             // Whatever answered at our socket is not our session, and
@@ -261,7 +298,8 @@ struct Client {
     /// need from it (see [`Client::all_received`]): there is no point in
     /// trying again, so we just finish delivering to the application.
     server_gone: bool,
-    /// `SIGHUP`, which `ssh` sends its `ProxyCommand` as it exits.
+    /// `SIGHUP`: `ssh` sends it to its `ProxyCommand` as it exits, and a
+    /// terminal which goes away sends it to its foreground process group.
     hangup: Signal,
     /// After `SIGHUP`, when we give up on finishing the session.
     hangup_deadline: Option<Instant>,
@@ -274,10 +312,13 @@ impl Client {
         let heartbeat_ms = u64::try_from(args.heartbeat_interval.as_millis()).unwrap_or(u64::MAX);
         let open = Message::open(heartbeat_ms, args.target.clone());
         // `ssh` sends its ProxyCommand SIGHUP as it exits, typically just
-        // after closing our stdin and stdout. We then still need to finish
-        // the session (send what we have read, and our shutdown), so that
-        // the server does not wait for us forever.
-        let mut hangup = signal(SignalKind::hangup())?;
+        // after closing our stdin and stdout; and when the terminal goes
+        // away, we are sent it along with the rest of the foreground
+        // process group. We then still need to finish the session (send
+        // what we have read, and our shutdown), so that the server does not
+        // wait for us forever. Our own `ssh` ignores SIGHUP (see
+        // `handshake`), so the channel is normally still there to do it on.
+        let mut hangup = signal_stream(SignalKind::hangup())?;
         let (child, channel, reply) = tokio::select! {
             r = handshake(&args, &open) => r.context("cannot open the session")?,
             _ = hangup.recv() => bail!("hung up while opening the session"),
@@ -452,7 +493,21 @@ impl Client {
                     self.server_gone = true;
                     return Ok(());
                 }
+                if e.code == ErrorCode::UnsupportedVersion {
+                    // The session may well be there, but not for us.
+                    bail!("cannot resume the session: {}: {}", e.code, e.message)
+                }
                 bail!("remote session is gone: {}: {}", e.code, e.message)
+            }
+            Err(AttemptError::Incompatible(e)) => {
+                if self.all_received() {
+                    // As for a rejection: all we could still do is deliver
+                    // our final acknowledgement, and we cannot.
+                    log::info!("cannot resume the session ({e:#}), but everything was received");
+                    self.server_gone = true;
+                    return Ok(());
+                }
+                Err(e.context("cannot resume the session"))
             }
             Err(AttemptError::Failed(e)) => {
                 log::info!(

@@ -20,7 +20,7 @@ use tokio::task::JoinSet;
 
 use crate::core::Config;
 use crate::fdpass::{self, Received};
-use crate::handshake::{self, ErrorCode, Message, Open, Target};
+use crate::handshake::{self, ErrorCode, HandshakeError, Message, Open, Target};
 use crate::paths::{Rendezvous, SessionId};
 use crate::runtime::{App, Channel, Event, FdIo, Pump};
 use crate::target;
@@ -62,6 +62,17 @@ fn std_fd(fd: RawFd) -> ManuallyDrop<File> {
     ManuallyDrop::new(unsafe { File::from_raw_fd(fd) })
 }
 
+/// The `error` code with which to refuse a request we could not decode:
+/// `unsupported_version` if it is of a version we do not support (which
+/// [`handshake::parse`] checks, for the shim and the daemon alike), and
+/// `bad_request` otherwise.
+fn request_error_code(e: &HandshakeError) -> ErrorCode {
+    match e {
+        HandshakeError::UnsupportedVersion(_) => ErrorCode::UnsupportedVersion,
+        _ => ErrorCode::BadRequest,
+    }
+}
+
 /// Writes an `error` reply to stdout, and returns the shim's exit code.
 fn shim_error(code: ErrorCode, message: impl Into<String>) -> i32 {
     let message = message.into();
@@ -77,7 +88,9 @@ fn shim_error(code: ErrorCode, message: impl Into<String>) -> i32 {
 /// and return the process exit code.
 ///
 /// Contract (from `doc/implementation.md`, "Server side"):
-/// 1. Reads one handshake message from stdin (never reading past it).
+/// 1. Reads one handshake message from stdin (never reading past it). One
+///    of a version we do not support gets an `error` (`unsupported_version`)
+///    reply, before anything else is done with it.
 /// 2. `open`: generates a session id, binds `<rendezvous>/<id>.sock`, and
 ///    spawns `<current_exe> _server --listen-fd <N>` with the listening socket
 ///    inherited, in a new session (`setsid`), stdin from `/dev/null`, and
@@ -111,7 +124,7 @@ pub fn run_shim() -> anyhow::Result<i32> {
                 format!("unexpected {} message", message_type(&other)),
             ));
         }
-        Err(e) => return Ok(shim_error(ErrorCode::BadRequest, e.to_string())),
+        Err(e) => return Ok(shim_error(request_error_code(&e), e.to_string())),
     };
 
     let conn = match StdUnixStream::connect(&socket) {
@@ -249,7 +262,10 @@ impl Drop for SocketGuard {
 ///   exit), and install the channel.
 /// - Thereafter, only `resume`s with an epoch strictly greater than the
 ///   highest accepted are allowed; others get an `error` reply and their fds
-///   closed. On acceptance: reply `ok`, swap the channel, and close the
+///   closed, leaving the session and its channel as they were. So does any
+///   message of a version we do not support (`unsupported_version`), which
+///   a newer shim may forward once the binary on disk has been upgraded. On
+///   acceptance: reply `ok`, swap the channel, and close the
 ///   previous channel's fds and Unix connection (letting the old shim exit).
 /// - Once the session finishes, lingers: it keeps serving the channel, and
 ///   accepting resumes, until the client closes the channel or [`LINGER`]
@@ -460,7 +476,7 @@ impl Daemon {
                 bail!("{msg}");
             }
             Err(e) => {
-                reply_error(write, ErrorCode::BadRequest, e.to_string()).await;
+                reply_error(write, request_error_code(&e), e.to_string()).await;
                 bail!("bad open message: {e}");
             }
         };
@@ -561,7 +577,9 @@ impl Daemon {
                     format!("expected resume, got {}", message_type(&other)),
                 ));
             }
-            Err(e) => return Err((ErrorCode::BadRequest, e.to_string())),
+            // Including a version we do not support, which must be refused
+            // here, before the session's channel is touched.
+            Err(e) => return Err((request_error_code(&e), e.to_string())),
         };
         if resume.session != self.id.as_str() {
             return Err((

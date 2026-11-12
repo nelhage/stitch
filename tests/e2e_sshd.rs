@@ -439,7 +439,7 @@ fn ssh_through_stitch_proxy_command() {
     // primary use case.
     let Some(sshd) = Sshd::start() else { return };
     let proxy = format!(
-        "{STITCH} tunnel --ssh {} --remote-stitch '{}' %h",
+        "{STITCH} tunnel --ssh {} --remote-stitch '{}' '%h'",
         sshd.ssh.display(),
         sshd.remote_stitch()
     );

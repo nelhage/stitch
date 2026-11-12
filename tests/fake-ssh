@@ -6,6 +6,9 @@
 # remote command through intermediate processes (two `cat`s), so that
 # killing them breaks the channel at both ends, as a network failure would.
 #
+# It sets no traps, so that, like OpenSSH, it and its relays keep ignoring
+# a SIGHUP which was already ignored when it started.
+#
 # Environment:
 #   FAKE_SSH_LOG   if set, a file to which one line per process is appended:
 #                  "<invocation pid> <role> <pid>", where role is `ssh` (this

@@ -6,7 +6,10 @@
 //! output is long-lived, uses the bare name `stitch` and relies on `$PATH`.
 //! `ssh` performs `%`-token expansion on that string and then runs it with the
 //! user's shell (`$SHELL -c "exec <command>"`), so the path is shell-quoted and
-//! then has any `%` doubled.
+//! then has any `%` doubled, and the host is passed as `'%h'`: unquoted, the
+//! shell would split it into words and expand globs in it, so that a host
+//! name such as `*.stitch` could become, via a suitably named file in the
+//! current directory, a `-o` option to `stitch tunnel`.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, OpenOptions};
@@ -44,6 +47,13 @@ pub const CONF_FILE_NAME: &str = "stitch.conf";
 /// The line `stitch ssh-config` ensures is at the top of `~/.ssh/config`.
 pub const INCLUDE_LINE: &str = "Include stitch.conf";
 
+/// The `ssh` `%h` token (the host name), quoted for the shell which runs the
+/// `ProxyCommand`. `ssh` substitutes the host name textually, so the quotes
+/// are what keep the shell from word-splitting and glob-expanding it.
+/// (`stitch tunnel` also rejects host names containing shell metacharacters;
+/// see [`crate::target::validate_ssh_host`].)
+const QUOTED_HOST: &str = "'%h'";
+
 /// Options for an `ssh` running over a stitch tunnel.
 ///
 /// - `ControlPath none`: never piggyback on an existing connection-sharing
@@ -67,7 +77,8 @@ pub fn shell_quote(s: &str) -> String {
 }
 
 /// The `ProxyCommand` value which runs `exe` followed by `args`. `args` is
-/// inserted verbatim (it may contain `ssh` `%` tokens such as `%h`); `exe` is
+/// inserted verbatim (it may contain `ssh` `%` tokens such as `%h`, which the
+/// caller must quote for the shell: see [`QUOTED_HOST`]); `exe` is
 /// shell-quoted and `%`-escaped.
 pub fn proxy_command(exe: &Path, args: &str) -> anyhow::Result<String> {
     let exe = exe
@@ -81,10 +92,10 @@ pub fn proxy_command(exe: &Path, args: &str) -> anyhow::Result<String> {
 
 /// The arguments (excluding `argv[0]`) with which `stitch ssh HOST args...`
 /// runs `ssh`:
-/// `-o ProxyCommand=<exe> tunnel %h -o ControlPath=none -o ServerAliveInterval=0 -o TCPKeepAlive=no HOST args...`
+/// `-o ProxyCommand=<exe> tunnel '%h' -o ControlPath=none -o ServerAliveInterval=0 -o TCPKeepAlive=no HOST args...`
 ///
 /// With `remote_stitch`, the tunnel is run as
-/// `<exe> tunnel --remote-stitch=<remote_stitch> %h`, to find `stitch` on the
+/// `<exe> tunnel --remote-stitch=<remote_stitch> '%h'`, to find `stitch` on the
 /// remote host there rather than on its `$PATH`.
 pub fn ssh_args(
     exe: &Path,
@@ -100,7 +111,8 @@ pub fn ssh_args(
         tunnel.push_str(" --remote-stitch=");
         tunnel.push_str(&shell_quote(bin).replace('%', "%%"));
     }
-    tunnel.push_str(" %h");
+    tunnel.push(' ');
+    tunnel.push_str(QUOTED_HOST);
     let mut out: Vec<OsString> = vec![
         "-o".into(),
         format!("ProxyCommand={}", proxy_command(exe, &tunnel)?).into(),
@@ -138,7 +150,10 @@ pub fn config_snippet(exe: &Path) -> anyhow::Result<String> {
     s.push_str(&format!("Host *{HOST_SUFFIX}\n"));
     s.push_str(&format!(
         "    ProxyCommand {}\n",
-        proxy_command(exe, &format!("tunnel --strip-suffix {HOST_SUFFIX} %h"))?
+        proxy_command(
+            exe,
+            &format!("tunnel --strip-suffix {HOST_SUFFIX} {QUOTED_HOST}")
+        )?
     ));
     for (k, v) in INNER_SSH_OPTIONS {
         s.push_str(&format!("    {k} {v}\n"));
@@ -426,7 +441,7 @@ mod tests {
             args,
             [
                 "-o",
-                "ProxyCommand=/bin/stitch tunnel %h",
+                "ProxyCommand=/bin/stitch tunnel '%h'",
                 "-o",
                 "ControlPath=none",
                 "-o",
@@ -467,7 +482,7 @@ mod tests {
         let s = config_snippet(Path::new("/opt/50%/stitch")).unwrap();
         assert!(s.contains("\nHost *.stitch\n"), "{s}");
         assert!(
-            s.contains("\n    ProxyCommand /opt/50%%/stitch tunnel --strip-suffix .stitch %h\n"),
+            s.contains("\n    ProxyCommand /opt/50%%/stitch tunnel --strip-suffix .stitch '%h'\n"),
             "{s}"
         );
         assert!(s.contains("\n    ControlPath none\n"));
@@ -476,9 +491,66 @@ mod tests {
 
         let s = config_snippet(Path::new(STITCH_COMMAND)).unwrap();
         assert!(
-            s.contains("\n    ProxyCommand stitch tunnel --strip-suffix .stitch %h\n"),
+            s.contains("\n    ProxyCommand stitch tunnel --strip-suffix .stitch '%h'\n"),
             "{s}"
         );
+    }
+
+    /// The `ProxyCommand` line of a config snippet.
+    fn snippet_proxy_command(snippet: &str) -> &str {
+        snippet
+            .lines()
+            .find_map(|l| l.trim_start().strip_prefix("ProxyCommand "))
+            .unwrap()
+    }
+
+    /// The host name reaches `stitch tunnel` as a single argument, whatever
+    /// it contains: in particular, the shell does not expand a glob in it
+    /// into the names of files in the current directory, one of which could
+    /// be `-oProxyCommand=...`.
+    #[test]
+    fn host_is_not_split_or_globbed() {
+        let snippet = config_snippet(Path::new(STITCH_COMMAND)).unwrap();
+        let args = ssh_args(Path::new("/bin/stitch"), None, OsStr::new("h"), &[]).unwrap();
+        let direct = args[1].to_str().unwrap();
+        let direct = direct.strip_prefix("ProxyCommand=").unwrap();
+        for host in [
+            "*",
+            "*.stitch",
+            "/*",
+            "a b",
+            "-oProxyCommand=x",
+            "$HOME",
+            "`id`",
+            "a;b",
+            "~",
+        ] {
+            assert_eq!(
+                run_like_ssh(snippet_proxy_command(&snippet), host),
+                ["stitch", "tunnel", "--strip-suffix", ".stitch", host],
+                "{host:?}"
+            );
+            assert_eq!(
+                run_like_ssh(direct, host),
+                ["/bin/stitch", "tunnel", host],
+                "{host:?}"
+            );
+        }
+    }
+
+    /// A `stitch.conf` written by a version which did not quote `%h` is
+    /// replaced by re-running `stitch ssh-config`.
+    #[test]
+    fn install_replaces_unquoted_snippet() {
+        let home = tempfile::tempdir().unwrap();
+        let new = config_snippet(Path::new(STITCH_COMMAND)).unwrap();
+        let old = new.replace(QUOTED_HOST, "%h");
+        assert_ne!(old, new);
+        install(home.path(), &old).unwrap();
+        let out = install(home.path(), &new).unwrap();
+        assert!(out.conf_written);
+        assert_eq!(out.include, IncludeStatus::AlreadyPresent);
+        assert_eq!(fs::read_to_string(&out.conf_path).unwrap(), new);
     }
 
     fn mode(p: &Path) -> u32 {

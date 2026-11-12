@@ -77,6 +77,6 @@ The final frame acknowledges the data. Its window is five bytes smaller because 
 - **Fixed-size header.** A variable-length encoding would save a few bytes per frame, but 24 bytes is small next to the overhead of the `ssh` packets on either side of it, and a fixed header keeps both the read loop and the tests simple.
 - **`seq` on every frame.** It is strictly required only on the first frame of a channel, since frames within a channel arrive in order. Carrying it on every frame gives a continuous consistency check.
 - **64-bit offsets.** Sessions may be very long-lived; 64-bit offsets mean we never need to consider wraparound.
-- **No version, magic number, or checksum.** Version negotiation belongs to the JSON handshake, which must also gate the use of any new flag bits; `ssh` already guarantees the integrity of the channel.
+- **No version, magic number, or checksum.** Version negotiation belongs to the JSON handshake, which must also gate the use of any new flag bits. Today that is a single version, which every receiver of a handshake message checks, refusing any other before a frame is exchanged (see "Setup handshake" in `implementation.md`); a frame format change must come with a new handshake version. As for checksums, `ssh` already guarantees the integrity of the channel.
 - **16-bit length.** This fixes the maximum payload at 65535 bytes, which ensures that a fresh `ack` and `window` are never delayed behind a single very large frame.
 - **32-bit window.** This limits the receive buffer to just under 4GiB, far more than is useful.

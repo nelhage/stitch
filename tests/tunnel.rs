@@ -5,6 +5,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use nix::sys::signal::{Signal, kill};
+use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 use stitch::handshake::{self, ErrorCode, Message};
 
@@ -638,6 +639,91 @@ fn open_failures() {
     assert!(client.contains("cannot open the session"), "{client}");
 }
 
+/// A host name which is a glob matching a file whose name looks like an
+/// option cannot inject that option into the `ssh` which `stitch tunnel`
+/// runs: the generated `ProxyCommand`s quote `%h`, so the shell which runs
+/// them does not expand it, and `stitch tunnel` then refuses such a host
+/// without running `ssh`.
+#[test]
+fn host_cannot_inject_ssh_options() {
+    let env = Env::new();
+    // A stand-in for ssh which records that, and how, it was run.
+    let ran = env.path("ssh-ran");
+    let recorder = env.path("record-ssh");
+    fs::write(
+        &recorder,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n", ran.display()),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&recorder).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(&recorder, perms).unwrap();
+
+    // The planted files: `*.stitch` matches both, and the first, unquoted,
+    // is `-oProxyCommand=...` to `stitch tunnel`, which passes `-o` options
+    // on to ssh.
+    let cwd = env.path("cwd");
+    fs::create_dir(&cwd).unwrap();
+    fs::write(cwd.join("-oProxyCommand=sh payload.sh;.stitch"), "").unwrap();
+    fs::write(cwd.join("a.stitch"), "").unwrap();
+
+    // Run a ProxyCommand as ssh does, for the host `*.stitch`: `%`-tokens
+    // expanded, then `$SHELL -c "exec <command>"`.
+    let run = |proxy_command: &str| {
+        let _ = fs::remove_file(&ran);
+        let expanded = proxy_command.replace("%h", "*.stitch");
+        let out = Command::new("sh")
+            .env("STITCH_SSH", &recorder)
+            .env("XDG_RUNTIME_DIR", env.dir.path())
+            .current_dir(&cwd)
+            .arg("-c")
+            .arg(format!("exec {expanded}"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        (
+            out.status,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            fs::read_to_string(&ran).ok(),
+        )
+    };
+
+    // Quoted, as `stitch ssh-config` and `stitch ssh` write it: the host is
+    // the literal `*.stitch`, which is refused, and ssh is never run.
+    let (status, stderr, ssh) = run(&format!("{STITCH} tunnel --strip-suffix .stitch '%h'"));
+    assert!(!status.success());
+    assert!(stderr.contains("invalid host name"), "{stderr}");
+    assert_eq!(ssh, None, "{stderr}");
+
+    // A control, to show that the above tests something: unquoted, as older
+    // versions wrote it, the shell expands the glob, and the planted name
+    // arrives as an option (with `a.stitch` as an unobjectionable host).
+    // Nothing `stitch tunnel` checks about the host can help with that; the
+    // quoting is the fix, and `stitch ssh-config` must be re-run to get it.
+    let (_, stderr, ssh) = run(&format!("{STITCH} tunnel --strip-suffix .stitch %h"));
+    let ssh = ssh.unwrap_or_default();
+    assert!(
+        ssh.contains("ProxyCommand=sh payload.sh"),
+        "stderr: {stderr}; ssh args: {ssh}"
+    );
+
+    // Given directly, a host which could be an option or contains a glob
+    // is refused before ssh is run.
+    for host in ["*.stitch", "-Thost", "a b", "$(id)"] {
+        let _ = fs::remove_file(&ran);
+        let out = env
+            .command()
+            .env("STITCH_SSH", &recorder)
+            .current_dir(&cwd)
+            .args(["tunnel", "--strip-suffix", ".stitch", host])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{host:?}");
+        assert!(!ran.exists(), "{host:?}");
+    }
+}
+
 /// Runs the shim directly, sending it `msg` (raw bytes), and returns its
 /// reply and exit status.
 fn shim_exchange(env: &Env, msg: &[u8]) -> (Message, ExitStatus) {
@@ -727,6 +813,59 @@ fn hangup_finishes_the_session() {
     env.assert_cleaned_up();
 }
 
+/// Whether `pid` is a running process (and not merely a zombie).
+fn running(pid: i32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The state follows the command name, which is in parentheses.
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z')),
+        Err(_) => false,
+    }
+}
+
+#[test]
+fn terminal_hangup_finishes_the_session() {
+    // When the terminal goes away, the kernel sends SIGHUP to the whole
+    // foreground process group: under `stitch ssh` that is the user's
+    // `ssh`, `stitch tunnel`, and the tunnel's own `ssh`. The last of these
+    // must survive it, because the tunnel needs the channel to finish the
+    // session: a new login may well be impossible without a terminal.
+    let env = Env::new();
+    let (port, server) = echo_server();
+    let mut t = env.tunnel_with(&[&format!("127.0.0.1:{port}")], |cmd| {
+        // A process group of its own, which its ssh then shares, as a
+        // terminal's foreground job would be.
+        cmd.process_group(0);
+    });
+    let mut stdin = t.stdin.take().unwrap();
+    let mut stdout = t.stdout.take().unwrap();
+    stdin.write_all(b"ping").unwrap();
+    assert_eq!(read_n(&mut stdout, 4), b"ping");
+    let inv = env.invocation(0);
+    // No new login can succeed.
+    fs::write(env.path("fail"), "").unwrap();
+
+    let start = Instant::now();
+    killpg(Pid::from_raw(t.child.id() as i32), Signal::SIGHUP).unwrap();
+    // The user's `ssh` dies of the same signal, closing our stdin and
+    // stdout.
+    drop(stdin);
+    drop(stdout);
+    let status = t.wait();
+    let elapsed = start.elapsed();
+    assert!(status.success(), "{status}");
+    // Well within the 10 s which the client allows after a hangup.
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    assert_eq!(env.invocations().len(), 1, "{}", client_log(&env));
+    assert_eq!(server.join().unwrap(), 4);
+    env.assert_cleaned_up();
+    // Ignoring SIGHUP must not let the ssh outlive the client.
+    wait_until("the ssh to exit", || {
+        !running(inv.ssh) && !inv.relays.iter().any(|&p| running(p))
+    });
+}
+
 #[test]
 fn bad_resumes_are_rejected() {
     let env = Env::new();
@@ -783,6 +922,200 @@ fn bad_resumes_are_rejected() {
     assert!(t.wait().success());
     assert_eq!(env.invocations().len(), 1);
     env.assert_cleaned_up();
+}
+
+/// Sends `msg` (a complete wire message) straight to the daemon listening
+/// on `socket`, as a shim would, and returns its reply.
+fn daemon_exchange(socket: &Path, msg: &[u8]) -> Message {
+    use std::os::fd::AsFd;
+    let conn = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    let (r, w_far) = nix::unistd::pipe().unwrap();
+    let (r_far, w) = nix::unistd::pipe().unwrap();
+    stitch::fdpass::send_with_fds(&conn, msg, &[r.as_fd(), w.as_fd()]).unwrap();
+    drop((r, w, w_far));
+    let (_, reply) = handshake::read_message(&mut fs::File::from(r_far)).unwrap();
+    reply
+}
+
+/// `msg`, as a wire message, with its `version` replaced.
+fn with_version(msg: &Message, version: u32) -> Vec<u8> {
+    let mut json: serde_json::Value = serde_json::from_slice(&msg.to_json()).unwrap();
+    json["version"] = version.into();
+    handshake::frame(json.to_string().as_bytes()).unwrap()
+}
+
+/// Checks that `reply` refuses protocol version 2, naming both versions.
+fn expect_unsupported_version(reply: Message) {
+    let Message::Error(e) = &reply else {
+        panic!("expected an error, got {reply:?}");
+    };
+    assert_eq!(e.code, ErrorCode::UnsupportedVersion, "{e:?}");
+    assert_eq!(e.code.as_str(), "unsupported_version");
+    assert!(e.message.contains("version 2 "), "{e:?}");
+    assert!(
+        e.message
+            .contains(&format!("only version {}", handshake::VERSION)),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn open_with_unsupported_version_is_refused() {
+    // A newer client must be refused in the handshake, where it can be
+    // told why, and not once frames it would send differently are flowing.
+    let env = Env::new();
+    let open = Message::open(
+        1000,
+        handshake::Target::Command {
+            command: "cat".into(),
+        },
+    );
+    let (reply, status) = shim_exchange(&env, &with_version(&open, 2));
+    expect_unsupported_version(reply);
+    assert!(!status.success(), "{status}");
+    // Even if the newer version's open looks nothing like ours.
+    let json = br#"{"type":"open","version":2,"streams":[]}"#;
+    let (reply, status) = shim_exchange(&env, &handshake::frame(json).unwrap());
+    expect_unsupported_version(reply);
+    assert!(!status.success(), "{status}");
+    // No session was started for it.
+    assert!(env.daemons().is_empty());
+    assert!(env.sockets().is_empty(), "{:?}", env.sockets());
+}
+
+#[test]
+fn resume_with_unsupported_version_is_refused() {
+    // E.g. the binary on the server was upgraded under a running session:
+    // a resume in a version the daemon does not speak must be refused in
+    // the handshake, leaving the session and its channel alone.
+    let env = Env::new();
+    let (port, server) = echo_server();
+    let mut t = env.tunnel(&[&format!("127.0.0.1:{port}")]);
+    let mut stdin = t.stdin.take().unwrap();
+    let mut stdout = t.stdout.take().unwrap();
+    stdin.write_all(b"one").unwrap();
+    assert_eq!(read_n(&mut stdout, 3), b"one");
+
+    let socket = env.sockets().pop().unwrap();
+    let id = socket.file_stem().unwrap().to_str().unwrap().to_owned();
+    // Otherwise acceptable: our session, and the next epoch.
+    let resume = with_version(&Message::resume(&id, &socket, 1), 2);
+    // Refused by the shim...
+    let (reply, status) = shim_exchange(&env, &resume);
+    expect_unsupported_version(reply);
+    assert!(!status.success(), "{status}");
+    // ... and by the daemon, should a (newer) shim forward it.
+    expect_unsupported_version(daemon_exchange(&socket, &resume));
+    let json = format!(r#"{{"type":"resume","version":2,"session":"{id}","token":"x"}}"#);
+    let unlike_ours = handshake::frame(json.as_bytes()).unwrap();
+    expect_unsupported_version(daemon_exchange(&socket, &unlike_ours));
+    wait_for_server_log(&env, "unsupported_version");
+
+    // The session carries on, on the channel it had.
+    stdin.write_all(b"two").unwrap();
+    assert_eq!(read_n(&mut stdout, 3), b"two");
+    assert_eq!(env.invocations().len(), 1);
+    assert!(!server_log(&env).contains("resuming"));
+
+    // And it can still be resumed: the refused resumes did not use up
+    // epoch 1, which is what the client sends next.
+    env.break_connection(&env.invocation(0));
+    stdin.write_all(b"three").unwrap();
+    assert_eq!(read_n(&mut stdout, 5), b"three");
+    wait_for_server_log(&env, "resuming on epoch 1");
+    drop(stdin);
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"");
+    assert!(t.wait().success());
+    assert_eq!(server.join().unwrap(), 11);
+    assert_eq!(env.invocations().len(), 2);
+    env.assert_cleaned_up();
+}
+
+/// Writes a stand-in for the remote `stitch` which answers with `reply`
+/// (the JSON of a handshake message): to every request, or, with
+/// `after_open`, only once the real `stitch` has served the open.
+fn canned_remote(env: &Env, reply: &str, after_open: bool) -> PathBuf {
+    assert!(!reply.contains('\''));
+    let remote = env.path("remote");
+    let script = format!(
+        r#"#!/bin/sh
+if [ -z "{after_open}" ] || [ -e "{dir}/opened" ]; then
+    msg='{reply}'
+    printf '%08x%s' ${{#msg}} "$msg"
+    exec sleep 30
+fi
+touch "{dir}/opened"
+exec {stitch} "$@"
+"#,
+        after_open = if after_open { "1" } else { "" },
+        dir = env.dir.path().display(),
+        stitch = STITCH,
+    );
+    fs::write(&remote, script).unwrap();
+    fs::set_permissions(&remote, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    remote
+}
+
+const OK_V2: &str =
+    r#"{"type":"ok","version":2,"session":"0123456789abcdef0123456789abcdef","socket":"/x"}"#;
+
+#[test]
+fn client_refuses_open_reply_with_unsupported_version() {
+    let env = Env::new();
+    let remote = canned_remote(&env, OK_V2, false);
+    let mut t = env.tunnel_with(&["--", "cat"], |cmd| {
+        cmd.env("STITCH_REMOTE", &remote);
+    });
+    let status = t.wait();
+    assert!(!status.success(), "{status}");
+    let log = client_log(&env);
+    assert!(log.contains("cannot open the session"), "{log}");
+    assert!(log.contains("unsupported protocol version 2"), "{log}");
+    assert!(!log.contains("opened session"), "{log}");
+}
+
+#[test]
+fn client_reports_error_reply_of_another_version() {
+    // A newer server refusing us says so in an `error` of its own version;
+    // the client must report that error, not the version it came in.
+    let env = Env::new();
+    let reply = r#"{"type":"error","version":2,"code":"unsupported_version","message":"this server needs version 2"}"#;
+    let remote = canned_remote(&env, reply, false);
+    let mut t = env.tunnel_with(&["--", "cat"], |cmd| {
+        cmd.env("STITCH_REMOTE", &remote);
+    });
+    let status = t.wait();
+    assert!(!status.success(), "{status}");
+    let log = client_log(&env);
+    assert!(
+        log.contains("unsupported_version: this server needs version 2"),
+        "{log}"
+    );
+}
+
+#[test]
+fn client_refuses_resume_reply_with_unsupported_version() {
+    // Unlike a garbled reply, this cannot be cured by trying again: the
+    // client gives up at once, rather than retrying forever.
+    let env = Env::new();
+    let remote = canned_remote(&env, OK_V2, true);
+    let mut t = env.tunnel_with(&["--", "cat"], |cmd| {
+        cmd.env("STITCH_REMOTE", &remote);
+    });
+    let mut stdin = t.stdin.take().unwrap();
+    let mut stdout = t.stdout.take().unwrap();
+    stdin.write_all(b"ping").unwrap();
+    assert_eq!(read_n(&mut stdout, 4), b"ping");
+    env.break_connection(&env.invocation(0));
+    let status = t.wait();
+    assert!(!status.success(), "{status}");
+    let log = client_log(&env);
+    assert!(log.contains("cannot resume the session"), "{log}");
+    assert!(log.contains("unsupported protocol version 2"), "{log}");
+    assert!(!log.contains("retrying"), "{log}");
+    assert_eq!(env.invocations().len(), 2);
 }
 
 #[test]

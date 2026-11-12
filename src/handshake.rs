@@ -15,6 +15,18 @@
 //! the JSON bytes of one message, and [`parse`] decodes them. The server shim
 //! uses the raw form to forward a message to the daemon without dropping
 //! fields it does not itself understand. [`read_message`] does both.
+//!
+//! # Versions
+//!
+//! Every message carries a `version`, and [`parse`] (and so every reader
+//! here) refuses a message whose version is not [`VERSION`], with
+//! [`HandshakeError::UnsupportedVersion`]: the version describes everything
+//! which follows the handshake (see "Design notes" in `doc/framing.md`), so a
+//! receiver must not go on to exchange frames with a peer it does not
+//! understand. A server reports this to the client as an `error` reply with
+//! the code `unsupported_version`. The one exception is the `error` message
+//! itself, which is accepted whatever its version: nothing follows it, and it
+//! is how a peer of another version tells us that it will not talk to us.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -51,6 +63,31 @@ pub enum HandshakeError {
     /// The body was not a valid message.
     #[error("invalid handshake message: {0}")]
     Json(#[from] serde_json::Error),
+    /// The message's `version` is not one we support.
+    #[error(transparent)]
+    UnsupportedVersion(#[from] UnsupportedVersion),
+}
+
+/// A message's `version` was not [`VERSION`], the only one we support.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported protocol version {received} (this stitch supports only version {VERSION})")]
+pub struct UnsupportedVersion {
+    /// The version received, as it appeared in the JSON.
+    pub received: String,
+}
+
+/// Checks a `version` received from a peer against the one we support.
+///
+/// This is the only place which decides whether a version is supported;
+/// [`parse`] applies it to every message other than an `error`.
+pub fn check_version(version: u32) -> Result<(), UnsupportedVersion> {
+    if version == VERSION {
+        Ok(())
+    } else {
+        Err(UnsupportedVersion {
+            received: version.to_string(),
+        })
+    }
 }
 
 /// What the server should connect a new session to.
@@ -121,6 +158,8 @@ pub enum ErrorCode {
     TargetFailed,
     /// Anything else that went wrong on the server.
     Internal,
+    /// The request's `version` is not one the server supports.
+    UnsupportedVersion,
     /// A code this version does not know.
     Unknown(String),
 }
@@ -133,6 +172,7 @@ impl ErrorCode {
             ErrorCode::BadRequest => "bad_request",
             ErrorCode::TargetFailed => "target_failed",
             ErrorCode::Internal => "internal",
+            ErrorCode::UnsupportedVersion => "unsupported_version",
             ErrorCode::Unknown(s) => s,
         }
     }
@@ -144,6 +184,7 @@ impl ErrorCode {
             "bad_request" => ErrorCode::BadRequest,
             "target_failed" => ErrorCode::TargetFailed,
             "internal" => ErrorCode::Internal,
+            "unsupported_version" => ErrorCode::UnsupportedVersion,
             _ => ErrorCode::Unknown(s),
         }
     }
@@ -169,8 +210,10 @@ impl<'de> Deserialize<'de> for ErrorCode {
 
 /// A handshake message.
 ///
-/// Unknown fields are ignored on decode. The `version` field is required but
-/// not checked here; callers decide how to treat other versions.
+/// Unknown fields are ignored on decode. The `version` field is required, and
+/// [`parse`] checks it: a message obtained from [`parse`] or one of the
+/// readers has a supported version, unless it is an `error`, whose version
+/// may be anything (see the module documentation).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Message {
@@ -235,9 +278,37 @@ impl Message {
     }
 }
 
-/// Decode a message from its JSON body (without the length prefix).
+/// Just enough of a message to find its version, whatever else it contains.
+#[derive(Deserialize)]
+struct VersionProbe {
+    version: serde_json::Value,
+}
+
+/// Decode a message from its JSON body (without the length prefix), refusing
+/// one whose version we do not support (see the module documentation).
+///
+/// The version is judged before the rest of the message: a message of
+/// another version is reported as [`HandshakeError::UnsupportedVersion`]
+/// even if it would not otherwise decode, since another version may well
+/// have changed the fields. An `error` message which does decode is
+/// returned whatever its version.
 pub fn parse(json: &[u8]) -> Result<Message, HandshakeError> {
-    Ok(serde_json::from_slice(json)?)
+    let parsed = serde_json::from_slice::<Message>(json);
+    match &parsed {
+        Ok(Message::Error(_)) => {}
+        Ok(msg) => check_version(msg.version())?,
+        Err(_) => {
+            if let Ok(probe) = serde_json::from_slice::<VersionProbe>(json)
+                && probe.version.as_u64() != Some(u64::from(VERSION))
+            {
+                return Err(UnsupportedVersion {
+                    received: probe.version.to_string(),
+                }
+                .into());
+            }
+        }
+    }
+    Ok(parsed?)
 }
 
 /// Prefix raw JSON bytes with their length, producing a complete wire
@@ -400,6 +471,7 @@ mod tests {
             Message::error(ErrorCode::BadRequest, "x"),
             Message::error(ErrorCode::TargetFailed, "x"),
             Message::error(ErrorCode::Internal, "x"),
+            Message::error(ErrorCode::UnsupportedVersion, "x"),
             Message::error(ErrorCode::Unknown("from_the_future".into()), "x"),
         ]
     }
@@ -597,6 +669,89 @@ mod tests {
                 version: 2,
                 code: ErrorCode::Unknown("exploded".into()),
                 message: "m".into()
+            })
+        );
+    }
+
+    #[test]
+    fn check_version_accepts_only_ours() {
+        assert_eq!(check_version(VERSION), Ok(()));
+        for v in [0, VERSION + 1, u32::MAX] {
+            let e = check_version(v).unwrap_err();
+            assert_eq!(e.received, v.to_string());
+            // The text reaches the user, and names both versions.
+            let text = e.to_string();
+            assert!(text.contains(&format!("version {v} ")), "{text}");
+            assert!(text.contains(&format!("only version {VERSION})")), "{text}");
+        }
+    }
+
+    fn unsupported(json: &str) -> String {
+        match parse(json.as_bytes()) {
+            Err(HandshakeError::UnsupportedVersion(e)) => e.received,
+            other => panic!("{json}: expected an unsupported version, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_versions_are_refused() {
+        // Every message which may be followed by frames.
+        for m in all_messages() {
+            if matches!(m, Message::Error(_)) {
+                continue;
+            }
+            for v in [0, 2] {
+                let mut json: serde_json::Value = serde_json::from_slice(&m.to_json()).unwrap();
+                json["version"] = v.into();
+                assert_eq!(unsupported(&json.to_string()), v.to_string());
+                // The readers refuse it too.
+                let wire = frame(json.to_string().as_bytes()).unwrap();
+                assert!(matches!(
+                    read_message(&mut Cursor::new(&wire)),
+                    Err(HandshakeError::UnsupportedVersion(_))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn version_is_judged_before_the_rest_of_the_message() {
+        // Another version may have changed anything else: missing fields,
+        // unknown types and targets, even the form of the version.
+        assert_eq!(unsupported(r#"{"type":"open","version":2}"#), "2");
+        assert_eq!(
+            unsupported(r#"{"type":"resume","version":3,"session":7}"#),
+            "3"
+        );
+        assert_eq!(unsupported(r#"{"type":"hello","version":2}"#), "2");
+        assert_eq!(unsupported(r#"{"version":2}"#), "2");
+        assert_eq!(
+            unsupported(r#"{"type":"ok","version":"2.1","session":"a","socket":"/x"}"#),
+            r#""2.1""#
+        );
+        assert_eq!(
+            unsupported(r#"{"type":"error","version":2,"code":17}"#),
+            "2"
+        );
+        // A malformed message of our own version is just malformed.
+        assert!(matches!(
+            parse(br#"{"type":"open","version":1}"#),
+            Err(HandshakeError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn error_of_another_version_is_accepted() {
+        // Nothing follows an `error`, and it is how a peer of another
+        // version refuses us; it must be reported, not masked.
+        let json =
+            br#"{"type":"error","version":2,"code":"unsupported_version","message":"too old"}"#;
+        assert_eq!(
+            parse(json).unwrap(),
+            Message::Error(ErrorReply {
+                version: 2,
+                code: ErrorCode::UnsupportedVersion,
+                message: "too old".into()
             })
         );
     }
