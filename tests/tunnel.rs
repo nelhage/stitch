@@ -560,6 +560,9 @@ fn speculative_resume() {
     // channel then recovers and carries data while the attempt is in
     // progress, until the client switches to the new channel regardless.
     let env = Env::new();
+    // Every resume waits until we let it go on (even one which a busy
+    // machine makes the client start early, with timeouts this short).
+    fs::write(env.path("hold"), "").unwrap();
     let (port, server) = echo_server();
     let mut t = env.tunnel(&[
         "--heartbeat-interval",
@@ -574,8 +577,6 @@ fn speculative_resume() {
     let writer = t.feed(data.clone(), limit.gate());
     let reader = t.drain(count.clone());
     wait_until("data to flow", || count.load(Ordering::SeqCst) >= 1 << 20);
-    // Every ssh from now on waits until we let it go on.
-    fs::write(env.path("hold"), "").unwrap();
     let first = env.invocation(0);
     env.stall_connection(&first);
     wait_for_client_log(&env, "reconnecting (epoch 1)");
@@ -607,18 +608,19 @@ fn slow_resume_is_abandoned() {
     let env = Env::new();
     let status = echo_through(&env, &["--connect-timeout", "1"], 4 << 20, 1 << 20, || {
         // The next ssh hangs until we let it go on, which we do only
-        // once the client has given up on it.
+        // once the client has given up on it, and killed it: until then,
+        // it cannot have exited by itself.
         fs::write(env.path("hold"), "").unwrap();
         let first = env.invocation(0);
         env.break_connection(&first);
         wait_for_client_log(&env, "no reply within");
+        let held = env.invocations()[1].ssh;
+        wait_until("the abandoned ssh to be killed", || !running(held));
         fs::remove_file(env.path("hold")).unwrap();
     });
     assert!(status.success(), "{status}");
     let invocations = env.invocations();
     assert!(invocations.len() >= 3, "{invocations:?}");
-    // The abandoned attempt's ssh was killed.
-    wait_until("the abandoned ssh to exit", || !running(invocations[1].ssh));
     env.assert_cleaned_up();
 }
 
