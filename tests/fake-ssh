@@ -15,9 +15,9 @@
 #                  script) or `relay` (a `cat`).
 #   FAKE_SSH_FAIL  if set to an existing file, exit 255 at once, as ssh does
 #                  when it cannot connect.
-#   FAKE_SSH_DELAY if set to an existing file, sleep for the number of seconds
-#                  it contains before running the command, as a slow ssh
-#                  handshake would.
+#   FAKE_SSH_HOLD  if set to an existing file, wait until it is removed before
+#                  running the command, as a slow ssh handshake would; the
+#                  test decides how slow.
 #   FAKE_SSH_DETACH if set to an existing file, leave the relays and the
 #                  remote command running in the background and exit at once,
 #                  like an ssh which exits while some other process still
@@ -46,8 +46,10 @@ log() {
 }
 log ssh $$
 
-if [ -n "$FAKE_SSH_DELAY" ] && [ -e "$FAKE_SSH_DELAY" ]; then
-    sleep "$(cat "$FAKE_SSH_DELAY")"
+if [ -n "$FAKE_SSH_HOLD" ]; then
+    while [ -e "$FAKE_SSH_HOLD" ]; do
+        sleep 0.01
+    done
 fi
 
 relay='if [ -n "$FAKE_SSH_LOG" ]; then echo "$FAKE_SSH_ID relay $$" >> "$FAKE_SSH_LOG"; fi; exec cat'
