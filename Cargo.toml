@@ -18,3 +18,9 @@ tokio = { version = "1.54.1", features = ["rt", "net", "io-util", "time", "proce
 [dev-dependencies]
 proptest = "1.12.0"
 tempfile = "3.27.0"
+
+[profile.release]
+# Arithmetic overflow panics rather than wrapping, as in debug builds: in a
+# protocol implementation, a wrapped sequence number, window or length
+# would more likely corrupt a stream silently than fail.
+overflow-checks = true

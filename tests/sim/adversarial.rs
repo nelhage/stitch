@@ -522,7 +522,11 @@ fn hostile_frames(seed: u64) -> u64 {
         let (hwm, v_ack, v_limit, v_shut) = v;
         let ack = r.range(v_ack, a.max_sent().max(v_ack));
         let window = (v_limit.max(ack) - ack + r.range(0, 200)).min(u64::from(u32::MAX));
-        let unfed = (hwm - a.recv_high_water_mark()) as usize;
+        // `v` is only a guess: once a `garbage` frame has corrupted a length
+        // field, the victim's framing can drift from ours (it may still hold
+        // part of a frame when `pending` is empty, then swallow later frames
+        // as its payload), so its high-water mark can pass `hwm`.
+        let unfed = hwm.saturating_sub(a.recv_high_water_mark()) as usize;
         let free = (a.window() as usize).saturating_sub(unfed);
         let mut seq = hwm;
         let mut len = r.usize_range(0, free.min(300));
@@ -639,6 +643,13 @@ fn hostile_frames_go_deep() {
         total / 200 >= 8,
         "hostile frames kill the session too early"
     );
+}
+
+/// A corrupted length field desynchronized the victim's framing from the
+/// generator's model, which used to underflow computing `unfed`.
+#[test]
+fn hostile_frames_regression_length_corruption() {
+    hostile_frames(12581757328608198469);
 }
 
 fn fuzz_cases() -> u32 {

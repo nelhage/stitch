@@ -87,7 +87,7 @@ impl Env {
         cmd.env("XDG_RUNTIME_DIR", self.dir.path())
             .env("FAKE_SSH_LOG", self.path("ssh.log"))
             .env("FAKE_SSH_FAIL", self.path("fail"))
-            .env("FAKE_SSH_DELAY", self.path("delay"))
+            .env("FAKE_SSH_HOLD", self.path("hold"))
             .env("STITCH_LOG", "debug")
             .env_remove("SSH_CONNECTION");
         cmd
@@ -333,8 +333,37 @@ fn echo_server() -> (u16, JoinHandle<usize>) {
     (port, handle)
 }
 
+/// A limit on how far [`Tunnel::feed`] may write: its [`gate`](Self::gate)
+/// holds the writer back at the limit until it is raised.
+///
+/// Tests that disrupt a transfer part-way through use this to make sure that
+/// there is data left to send afterwards: otherwise, in an optimized build,
+/// a transfer of a few MiB can be over before the test gets to disrupt it.
+#[derive(Clone)]
+struct WriteLimit(Arc<AtomicUsize>);
+
+impl WriteLimit {
+    fn new(limit: usize) -> WriteLimit {
+        WriteLimit(Arc::new(AtomicUsize::new(limit)))
+    }
+
+    fn set(&self, limit: usize) {
+        self.0.store(limit, Ordering::SeqCst);
+    }
+
+    fn gate(&self) -> impl Fn(usize) + Send + 'static {
+        let limit = self.0.clone();
+        move |offset| {
+            while offset >= limit.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 /// Sends `data` through a tunnel to an echo server, calling `during` once
-/// `trigger_at` bytes have come back. Returns the tunnel's exit status.
+/// `trigger_at` bytes have come back. At most 1 MiB more than `trigger_at`
+/// is written before `during` returns. Returns the tunnel's exit status.
 fn echo_through(
     env: &Env,
     args: &[&str],
@@ -349,12 +378,14 @@ fn echo_through(
     let mut t = env.tunnel(&all_args);
     let data = test_data(len, 7);
     let count = Arc::new(AtomicUsize::new(0));
-    let writer = t.feed(data.clone(), |_| {});
+    let limit = WriteLimit::new(trigger_at + (1 << 20));
+    let writer = t.feed(data.clone(), limit.gate());
     let reader = t.drain(count.clone());
     wait_until("data to flow", || {
         count.load(Ordering::SeqCst) >= trigger_at
     });
     during();
+    limit.set(usize::MAX);
     let status = t.wait();
     writer.join().unwrap();
     let got = reader.join().unwrap();
@@ -453,7 +484,11 @@ fn resume_after_repeated_kills() {
     let mut t = env.tunnel(&[&format!("127.0.0.1:{port}")]);
     let data = test_data(4 << 20, 9);
     let count = Arc::new(AtomicUsize::new(0));
-    let writer = t.feed(data.clone(), |_| {});
+    // Kill `n` comes once (n + 1) MiB has come back, with at most another
+    // 512 KiB written, so that the transfer is never over before a kill.
+    let ahead = 512 << 10;
+    let limit = WriteLimit::new((1 << 20) + ahead);
+    let writer = t.feed(data.clone(), limit.gate());
     let reader = t.drain(count.clone());
     for n in 0..3 {
         wait_until("data to flow", || {
@@ -461,7 +496,9 @@ fn resume_after_repeated_kills() {
         });
         let inv = env.invocation(n);
         env.break_connection(&inv);
+        limit.set((n + 2) * (1 << 20) + ahead);
     }
+    limit.set(usize::MAX);
     assert!(t.wait().success());
     writer.join().unwrap();
     assert!(reader.join().unwrap() == data);
@@ -523,6 +560,9 @@ fn speculative_resume() {
     // channel then recovers and carries data while the attempt is in
     // progress, until the client switches to the new channel regardless.
     let env = Env::new();
+    // Every resume waits until we let it go on (even one which a busy
+    // machine makes the client start early, with timeouts this short).
+    fs::write(env.path("hold"), "").unwrap();
     let (port, server) = echo_server();
     let mut t = env.tunnel(&[
         "--heartbeat-interval",
@@ -533,66 +573,54 @@ fn speculative_resume() {
     ]);
     let data = test_data(4 << 20, 11);
     let count = Arc::new(AtomicUsize::new(0));
-    let gate = Arc::new(AtomicUsize::new(0));
-    let writer = t.feed(data.clone(), {
-        let gate = gate.clone();
-        move |offset| {
-            if offset >= 2 << 20 {
-                while gate.load(Ordering::SeqCst) == 0 {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
-        }
-    });
+    let limit = WriteLimit::new(2 << 20);
+    let writer = t.feed(data.clone(), limit.gate());
     let reader = t.drain(count.clone());
     wait_until("data to flow", || count.load(Ordering::SeqCst) >= 1 << 20);
-    fs::write(env.path("delay"), "2").unwrap();
     let first = env.invocation(0);
     env.stall_connection(&first);
     wait_for_client_log(&env, "reconnecting (epoch 1)");
     for &p in &first.relays {
         signal(p, Signal::SIGCONT);
     }
-    // Everything written so far comes back over the old channel.
+    // Everything written so far comes back over the old channel, while
+    // the attempt is held up.
     wait_until("old channel to recover", || {
         count.load(Ordering::SeqCst) >= 2 << 20
     });
     assert!(!client_log(&env).contains("reconnected"));
+    fs::remove_file(env.path("hold")).unwrap();
     wait_for_client_log(&env, "reconnected (epoch 1)");
-    gate.store(1, Ordering::SeqCst);
+    limit.set(usize::MAX);
 
     assert!(t.wait().success());
     writer.join().unwrap();
     assert!(reader.join().unwrap() == data);
     assert_eq!(server.join().unwrap(), data.len());
-    assert_eq!(env.invocations().len(), 2);
+    // Normally 2; but with timeouts this short, a busy machine may make
+    // the new channel time out too.
+    assert!(env.invocations().len() >= 2);
     env.assert_cleaned_up();
 }
 
 #[test]
 fn slow_resume_is_abandoned() {
     let env = Env::new();
-    let status = echo_through(
-        &env,
-        &["--connect-timeout", "0.3"],
-        4 << 20,
-        1 << 20,
-        || {
-            fs::write(env.path("delay"), "3").unwrap();
-            let first = env.invocation(0);
-            env.break_connection(&first);
-            wait_for_client_log(&env, "no reply within");
-            fs::remove_file(env.path("delay")).unwrap();
-        },
-    );
+    let status = echo_through(&env, &["--connect-timeout", "1"], 4 << 20, 1 << 20, || {
+        // The next ssh hangs until we let it go on, which we do only
+        // once the client has given up on it, and killed it: until then,
+        // it cannot have exited by itself.
+        fs::write(env.path("hold"), "").unwrap();
+        let first = env.invocation(0);
+        env.break_connection(&first);
+        wait_for_client_log(&env, "no reply within");
+        let held = env.invocations()[1].ssh;
+        wait_until("the abandoned ssh to be killed", || !running(held));
+        fs::remove_file(env.path("hold")).unwrap();
+    });
     assert!(status.success(), "{status}");
     let invocations = env.invocations();
     assert!(invocations.len() >= 3, "{invocations:?}");
-    // The abandoned attempt's ssh was killed.
-    assert!(
-        kill(Pid::from_raw(invocations[1].ssh), None).is_err(),
-        "abandoned ssh still running"
-    );
     env.assert_cleaned_up();
 }
 
@@ -846,17 +874,15 @@ fn terminal_hangup_finishes_the_session() {
     // No new login can succeed.
     fs::write(env.path("fail"), "").unwrap();
 
-    let start = Instant::now();
     killpg(Pid::from_raw(t.child.id() as i32), Signal::SIGHUP).unwrap();
     // The user's `ssh` dies of the same signal, closing our stdin and
     // stdout.
     drop(stdin);
     drop(stdout);
+    // Had the session not finished on the channel it had, the client would
+    // have given up 10 s after the hangup, and failed.
     let status = t.wait();
-    let elapsed = start.elapsed();
     assert!(status.success(), "{status}");
-    // Well within the 10 s which the client allows after a hangup.
-    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     assert_eq!(env.invocations().len(), 1, "{}", client_log(&env));
     assert_eq!(server.join().unwrap(), 4);
     env.assert_cleaned_up();
@@ -1199,7 +1225,6 @@ fn slow_reader_at_session_end() {
     // finished.
     let mut got = read_n(&mut stdout, 1_300_000);
     wait_for_server_log(&env, "session finished");
-    std::thread::sleep(Duration::from_millis(500));
     stdout.read_to_end(&mut got).unwrap();
     assert_eq!(got.len(), len);
     assert!(got.iter().all(|&b| b == 0));
@@ -1225,9 +1250,14 @@ fn channel_lost_at_session_end_while_delivering() {
     let mut stdout = t.stdout.take().unwrap();
     let mut got = read_n(&mut stdout, 100_000);
     wait_for_server_log(&env, "session finished");
+    // Hold up the client's resume until the server has gone, so that it
+    // finds no session, rather than resuming a lingering one.
+    fs::write(env.path("hold"), "").unwrap();
     env.break_connection(&env.invocation(0));
     wait_for_client_log(&env, "reconnecting (epoch 1)");
-    std::thread::sleep(Duration::from_millis(500));
+    wait_until("the daemon to exit", || env.daemons().is_empty());
+    fs::remove_file(env.path("hold")).unwrap();
+    wait_for_client_log(&env, "but everything was received");
     stdout.read_to_end(&mut got).unwrap();
     assert_eq!(got.len(), len);
     let status = t.wait();
@@ -1268,11 +1298,21 @@ fn final_ack_lost_resume_during_linger() {
 #[test]
 fn ssh_exits_before_the_channel_closes() {
     // An ssh which exits while its channel is still open (held by another
-    // process) is not, by itself, a reason to resume at once: the channel
-    // may still carry the end of the session.
+    // process) does not make the client give up on the channel: it may
+    // still carry the end of the session. (When the client resumes in
+    // that case is up to `client::policy`, and tested there.)
     let env = Env::new();
     fs::write(env.path("detach"), "").unwrap();
-    let mut t = env.tunnel_with(&["--", "echo", "hello"], |cmd| {
+    // The remote command: once the session is open, no other ssh can
+    // succeed, so the end of the session can only come over the first
+    // channel; and that end comes only once the client has seen its ssh
+    // exit.
+    let command = format!(
+        "touch {fail}; until grep -q 'ssh exited' {log}; do sleep 0.01; done; echo hello",
+        fail = env.path("fail").display(),
+        log = env.path("client.err").display(),
+    );
+    let mut t = env.tunnel_with(&["--", &command], |cmd| {
         cmd.env("FAKE_SSH_DETACH", env.path("detach"));
     });
     drop(t.stdin.take());
@@ -1282,7 +1322,6 @@ fn ssh_exits_before_the_channel_closes() {
     assert_eq!(out.join().unwrap(), b"hello\n");
     let log = client_log(&env);
     assert!(log.contains("ssh exited"), "{log}");
-    assert!(!log.contains("reconnecting"), "{log}");
     env.assert_cleaned_up();
 }
 
