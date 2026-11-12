@@ -5,6 +5,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use nix::sys::signal::{Signal, kill};
+use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 use stitch::handshake::{self, ErrorCode, Message};
 
@@ -810,6 +811,59 @@ fn hangup_finishes_the_session() {
     assert!(status.success(), "{status}");
     assert_eq!(server.join().unwrap(), 7);
     env.assert_cleaned_up();
+}
+
+/// Whether `pid` is a running process (and not merely a zombie).
+fn running(pid: i32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The state follows the command name, which is in parentheses.
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z')),
+        Err(_) => false,
+    }
+}
+
+#[test]
+fn terminal_hangup_finishes_the_session() {
+    // When the terminal goes away, the kernel sends SIGHUP to the whole
+    // foreground process group: under `stitch ssh` that is the user's
+    // `ssh`, `stitch tunnel`, and the tunnel's own `ssh`. The last of these
+    // must survive it, because the tunnel needs the channel to finish the
+    // session: a new login may well be impossible without a terminal.
+    let env = Env::new();
+    let (port, server) = echo_server();
+    let mut t = env.tunnel_with(&[&format!("127.0.0.1:{port}")], |cmd| {
+        // A process group of its own, which its ssh then shares, as a
+        // terminal's foreground job would be.
+        cmd.process_group(0);
+    });
+    let mut stdin = t.stdin.take().unwrap();
+    let mut stdout = t.stdout.take().unwrap();
+    stdin.write_all(b"ping").unwrap();
+    assert_eq!(read_n(&mut stdout, 4), b"ping");
+    let inv = env.invocation(0);
+    // No new login can succeed.
+    fs::write(env.path("fail"), "").unwrap();
+
+    let start = Instant::now();
+    killpg(Pid::from_raw(t.child.id() as i32), Signal::SIGHUP).unwrap();
+    // The user's `ssh` dies of the same signal, closing our stdin and
+    // stdout.
+    drop(stdin);
+    drop(stdout);
+    let status = t.wait();
+    let elapsed = start.elapsed();
+    assert!(status.success(), "{status}");
+    // Well within the 10 s which the client allows after a hangup.
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    assert_eq!(env.invocations().len(), 1, "{}", client_log(&env));
+    assert_eq!(server.join().unwrap(), 4);
+    env.assert_cleaned_up();
+    // Ignoring SIGHUP must not let the ssh outlive the client.
+    wait_until("the ssh to exit", || {
+        !running(inv.ssh) && !inv.relays.iter().any(|&p| running(p))
+    });
 }
 
 #[test]

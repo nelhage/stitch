@@ -15,8 +15,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
+use nix::sys::signal;
 use tokio::process::{Child, Command};
-use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::signal::unix::{Signal, SignalKind, signal as signal_stream};
 use tokio::time::Instant;
 
 use crate::core::Config;
@@ -87,10 +88,13 @@ pub struct TunnelArgs {
 /// - On success, kills the old `ssh` and swaps the channel.
 /// - When the session finishes, flushes, closes the channel, waits briefly
 ///   for `ssh` to exit (killing it otherwise), and returns `Ok(0)`.
-/// - `SIGHUP` (which `ssh` sends its `ProxyCommand` as it exits) does not
-///   kill the process: the session carries on until it finishes (normally
-///   at once, since stdin and stdout have been closed too), for up to
-///   10 s.
+/// - `SIGHUP` does not kill the process: the session carries on until it
+///   finishes (normally at once, since stdin and stdout have been closed
+///   too), for up to 10 s. It comes from `ssh`, which sends it to its
+///   `ProxyCommand` as it exits, or from the terminal going away, which
+///   sends it to the whole foreground process group: our `ssh` runs with
+///   `SIGHUP` ignored, so that the channel survives that to carry the end
+///   of the session.
 pub fn run_tunnel(args: TunnelArgs) -> anyhow::Result<i32> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -121,6 +125,16 @@ fn ssh_args(args: &TunnelArgs) -> Vec<OsString> {
 /// Runs `ssh` to the host, sends `msg` to the shim, and reads its reply.
 /// Returns the `ssh` process, the channel (its stdout and stdin), and the
 /// reply.
+///
+/// The `ssh` runs with `SIGHUP` ignored (which OpenSSH respects: it leaves
+/// an ignored `SIGHUP` alone). It shares our process group, so when the
+/// terminal goes away it is sent `SIGHUP` along with us; if that killed
+/// it, we could only finish the session (see [`HANGUP_TIMEOUT`]) by logging
+/// in again, within seconds and with no terminal to authenticate on, and
+/// failing that would leave the server's session waiting forever. It stays
+/// in our process group and session all the same, since it must be able to
+/// prompt on the terminal. Its lifetime is ours to manage instead: it is
+/// killed when dropped, and should we die first, it sees EOF on its stdin.
 async fn handshake(args: &TunnelArgs, msg: &Message) -> anyhow::Result<(Child, Channel, Message)> {
     let mut cmd = Command::new(&args.ssh);
     cmd.args(ssh_args(args))
@@ -128,6 +142,14 @@ async fn handshake(args: &TunnelArgs, msg: &Message) -> anyhow::Result<(Child, C
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    // SAFETY: the closure runs between `fork` and `exec`, and makes only an
+    // async-signal-safe call (`signal`).
+    unsafe {
+        cmd.pre_exec(|| {
+            signal::signal(signal::Signal::SIGHUP, signal::SigHandler::SigIgn)?;
+            Ok(())
+        });
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("cannot run {}", args.ssh.to_string_lossy()))?;
@@ -261,7 +283,8 @@ struct Client {
     /// need from it (see [`Client::all_received`]): there is no point in
     /// trying again, so we just finish delivering to the application.
     server_gone: bool,
-    /// `SIGHUP`, which `ssh` sends its `ProxyCommand` as it exits.
+    /// `SIGHUP`: `ssh` sends it to its `ProxyCommand` as it exits, and a
+    /// terminal which goes away sends it to its foreground process group.
     hangup: Signal,
     /// After `SIGHUP`, when we give up on finishing the session.
     hangup_deadline: Option<Instant>,
@@ -274,10 +297,13 @@ impl Client {
         let heartbeat_ms = u64::try_from(args.heartbeat_interval.as_millis()).unwrap_or(u64::MAX);
         let open = Message::open(heartbeat_ms, args.target.clone());
         // `ssh` sends its ProxyCommand SIGHUP as it exits, typically just
-        // after closing our stdin and stdout. We then still need to finish
-        // the session (send what we have read, and our shutdown), so that
-        // the server does not wait for us forever.
-        let mut hangup = signal(SignalKind::hangup())?;
+        // after closing our stdin and stdout; and when the terminal goes
+        // away, we are sent it along with the rest of the foreground
+        // process group. We then still need to finish the session (send
+        // what we have read, and our shutdown), so that the server does not
+        // wait for us forever. Our own `ssh` ignores SIGHUP (see
+        // `handshake`), so the channel is normally still there to do it on.
+        let mut hangup = signal_stream(SignalKind::hangup())?;
         let (child, channel, reply) = tokio::select! {
             r = handshake(&args, &open) => r.context("cannot open the session")?,
             _ = hangup.recv() => bail!("hung up while opening the session"),
