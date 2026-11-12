@@ -333,8 +333,37 @@ fn echo_server() -> (u16, JoinHandle<usize>) {
     (port, handle)
 }
 
+/// A limit on how far [`Tunnel::feed`] may write: its [`gate`](Self::gate)
+/// holds the writer back at the limit until it is raised.
+///
+/// Tests that disrupt a transfer part-way through use this to make sure that
+/// there is data left to send afterwards: otherwise, in an optimized build,
+/// a transfer of a few MiB can be over before the test gets to disrupt it.
+#[derive(Clone)]
+struct WriteLimit(Arc<AtomicUsize>);
+
+impl WriteLimit {
+    fn new(limit: usize) -> WriteLimit {
+        WriteLimit(Arc::new(AtomicUsize::new(limit)))
+    }
+
+    fn set(&self, limit: usize) {
+        self.0.store(limit, Ordering::SeqCst);
+    }
+
+    fn gate(&self) -> impl Fn(usize) + Send + 'static {
+        let limit = self.0.clone();
+        move |offset| {
+            while offset >= limit.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 /// Sends `data` through a tunnel to an echo server, calling `during` once
-/// `trigger_at` bytes have come back. Returns the tunnel's exit status.
+/// `trigger_at` bytes have come back. At most 1 MiB more than `trigger_at`
+/// is written before `during` returns. Returns the tunnel's exit status.
 fn echo_through(
     env: &Env,
     args: &[&str],
@@ -349,12 +378,14 @@ fn echo_through(
     let mut t = env.tunnel(&all_args);
     let data = test_data(len, 7);
     let count = Arc::new(AtomicUsize::new(0));
-    let writer = t.feed(data.clone(), |_| {});
+    let limit = WriteLimit::new(trigger_at + (1 << 20));
+    let writer = t.feed(data.clone(), limit.gate());
     let reader = t.drain(count.clone());
     wait_until("data to flow", || {
         count.load(Ordering::SeqCst) >= trigger_at
     });
     during();
+    limit.set(usize::MAX);
     let status = t.wait();
     writer.join().unwrap();
     let got = reader.join().unwrap();
@@ -453,7 +484,11 @@ fn resume_after_repeated_kills() {
     let mut t = env.tunnel(&[&format!("127.0.0.1:{port}")]);
     let data = test_data(4 << 20, 9);
     let count = Arc::new(AtomicUsize::new(0));
-    let writer = t.feed(data.clone(), |_| {});
+    // Kill `n` comes once (n + 1) MiB has come back, with at most another
+    // 512 KiB written, so that the transfer is never over before a kill.
+    let ahead = 512 << 10;
+    let limit = WriteLimit::new((1 << 20) + ahead);
+    let writer = t.feed(data.clone(), limit.gate());
     let reader = t.drain(count.clone());
     for n in 0..3 {
         wait_until("data to flow", || {
@@ -461,7 +496,9 @@ fn resume_after_repeated_kills() {
         });
         let inv = env.invocation(n);
         env.break_connection(&inv);
+        limit.set((n + 2) * (1 << 20) + ahead);
     }
+    limit.set(usize::MAX);
     assert!(t.wait().success());
     writer.join().unwrap();
     assert!(reader.join().unwrap() == data);
