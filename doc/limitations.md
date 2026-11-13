@@ -31,7 +31,10 @@ has to share that terminal:
 
 The initial connection is different: it is made before the tunnel is in use
 and has no timeout, so an interactive login works there. A session opened that
-way can then never resume.
+way can then never resume. Note that while `ssh`'s prompts appear (it writes
+them to the terminal directly), anything it writes to stderr, which `stitch`
+holds back unless the connection fails, does not: a server's pre-login banner,
+or the instructions which accompany a keyboard-interactive prompt.
 
 Related behaviour to be aware of even with non-interactive authentication:
 
@@ -39,8 +42,10 @@ Related behaviour to be aware of even with non-interactive authentication:
   failure from a permanent one. If your key is revoked or the server's host key
   changes while you are disconnected, the session keeps retrying until you
   close it.
-- The resuming `ssh` writes its own errors (for example "Could not resolve
-  hostname") to your terminal on each failed attempt while you are offline.
+- The resuming `ssh`'s errors (for example "Could not resolve hostname") are
+  not shown, since they would land in the middle of your session; they are
+  logged with `STITCH_LOG=info`. So a resume which can never succeed looks the
+  same as one waiting for the network to come back.
 
 ## Server-side `ClientAliveInterval` ends idle-while-offline sessions
 

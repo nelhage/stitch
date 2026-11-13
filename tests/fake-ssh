@@ -13,6 +13,8 @@
 #   FAKE_SSH_LOG   if set, a file to which one line per process is appended:
 #                  "<invocation pid> <role> <pid>", where role is `ssh` (this
 #                  script) or `relay` (a `cat`).
+#   FAKE_SSH_STDERR if set, a line which every invocation writes to stderr
+#                  first, as ssh may write a warning even when it succeeds.
 #   FAKE_SSH_FAIL  if set to an existing file, exit 255 at once, as ssh does
 #                  when it cannot connect.
 #   FAKE_SSH_HOLD  if set to an existing file, every invocation but the first
@@ -33,6 +35,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 shift  # the host
+
+if [ -n "$FAKE_SSH_STDERR" ]; then
+    echo "$FAKE_SSH_STDERR" >&2
+fi
 
 if [ -n "$FAKE_SSH_FAIL" ] && [ -e "$FAKE_SSH_FAIL" ]; then
     echo "fake-ssh: connection refused" >&2
