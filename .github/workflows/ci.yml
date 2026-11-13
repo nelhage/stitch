@@ -76,8 +76,8 @@ jobs:
         env:
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
 
-  # The integration tests depend on /proc, so on macOS we only check that
-  # everything builds and is clippy-clean.
+  # The process-level integration tests (tunnel, e2e_sshd) depend on /proc
+  # and are compiled out on macOS; everything else runs.
   build-macos:
     runs-on: macos-latest
     steps:
@@ -94,5 +94,7 @@ jobs:
           restore-keys: build-${{ runner.os }}-${{ runner.arch }}-
       - name: build
         run: cargo test --locked --no-run
+      - name: test
+        run: cargo test --locked
       - name: clippy
         run: cargo clippy --locked --all-targets -- -D warnings

@@ -5,8 +5,9 @@
 //! so that the driver can wait for readiness and then perform a single
 //! non-blocking `read`/`write` without ever blocking the event loop.
 //!
-//! Some fds cannot be watched by `epoll` at all: regular files and some
-//! character devices such as `/dev/null` (`epoll_ctl` fails with `EPERM`).
+//! Some fds cannot be watched by `epoll`/`kqueue` at all: regular files and
+//! some character devices such as `/dev/null` (`epoll_ctl` fails with
+//! `EPERM`, `kevent` with `EINVAL`).
 //! Reads and writes on those never block for long, so they are simply treated
 //! as always ready and used synchronously.
 
@@ -119,9 +120,21 @@ impl FdIo {
     }
 
     fn build(fd: OwnedFd, interest: Interest, shared: bool) -> io::Result<FdIo> {
-        let is_socket = fstat(&fd)
-            .map(|st| SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT == SFlag::S_IFSOCK)
-            .unwrap_or(false);
+        let kind = fstat(&fd)
+            .map(|st| SFlag::from_bits_truncate(st.st_mode) & SFlag::S_IFMT)
+            .ok();
+        let is_socket = kind == Some(SFlag::S_IFSOCK);
+        // kqueue (unlike epoll) accepts regular files, but its read filter
+        // fires only while the offset is short of EOF, so waiting on it would
+        // hang rather than read the EOF. Always use them synchronously.
+        if kind == Some(SFlag::S_IFREG) {
+            return Ok(FdIo {
+                inner: Inner::Sync(fd),
+                interest,
+                is_socket,
+                restore_flags: None,
+            });
+        }
         let orig = set_nonblocking(&fd)?;
         let changed = !orig.contains(OFlag::O_NONBLOCK);
         let restore_flags = (shared && changed).then_some(orig);
@@ -131,7 +144,10 @@ impl FdIo {
             Ok(afd) => Inner::Async(afd),
             Err(e) => {
                 let (fd, err) = e.into_parts();
-                if err.raw_os_error() != Some(Errno::EPERM as i32) {
+                // epoll reports an fd it cannot watch with EPERM; kqueue
+                // (e.g. for /dev/null) with EINVAL.
+                let errno = err.raw_os_error();
+                if errno != Some(Errno::EPERM as i32) && errno != Some(Errno::EINVAL as i32) {
                     return Err(err);
                 }
                 // `epoll` cannot watch this fd; IO on it never blocks for
