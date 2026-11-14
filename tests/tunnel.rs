@@ -671,6 +671,64 @@ fn open_failures() {
     assert!(client.contains("cannot open the session"), "{client}");
 }
 
+#[test]
+fn ssh_stderr_reported_when_open_fails() {
+    let env = Env::new();
+    fs::write(env.path("fail"), "").unwrap();
+    let mut t = env.tunnel_with(&["--", "cat"], |cmd| {
+        cmd.env("STITCH_LOG", "warn");
+    });
+    assert!(!t.wait().success());
+    // ssh's own words, as it wrote them, and then ours.
+    let log = client_log(&env);
+    let ssh = log
+        .lines()
+        .position(|l| l == "fake-ssh: connection refused")
+        .unwrap_or_else(|| panic!("{log}"));
+    let ours = log
+        .lines()
+        .position(|l| l.starts_with("stitch: cannot open the session"))
+        .unwrap_or_else(|| panic!("{log}"));
+    assert!(ssh < ours, "{log}");
+}
+
+#[test]
+fn ssh_stderr_hidden_once_open() {
+    let env = Env::new();
+    let mut t = env.tunnel_with(&["--", "cat"], |cmd| {
+        cmd.env("STITCH_LOG", "info")
+            .env("FAKE_SSH_STDERR", "fake-ssh: chatter");
+    });
+    let mut stdin = t.stdin.take().unwrap();
+    let mut stdout = t.stdout.take().unwrap();
+    let mut ping = |n: u8| {
+        stdin.write_all(&[n]).unwrap();
+        assert_eq!(read_n(&mut stdout, 1), [n]);
+    };
+    ping(1);
+    // A successful resume.
+    env.break_connection(&env.invocation(0));
+    wait_for_client_log(&env, "reconnected (epoch 1)");
+    ping(2);
+    // A failed one: its output is logged, along with the failure.
+    fs::write(env.path("fail"), "").unwrap();
+    env.break_connection(&env.invocation(1));
+    wait_for_client_log(&env, "reconnect attempt failed");
+    fs::remove_file(env.path("fail")).unwrap();
+    ping(3);
+    drop(stdin);
+    drop(stdout);
+    assert!(t.wait().success());
+
+    // Of the successful ssh's output, nothing is seen (it would be logged
+    // only at `debug`); the failed one's is logged.
+    let log = client_log(&env);
+    assert_eq!(env.invocations().len(), 3, "{log}");
+    assert!(log.contains("ssh: fake-ssh: connection refused"), "{log}");
+    assert_eq!(log.matches("ssh: fake-ssh: chatter").count(), 1, "{log}");
+    assert_eq!(log.matches("chatter").count(), 1, "{log}");
+}
+
 /// A host name which is a glob matching a file whose name looks like an
 /// option cannot inject that option into the `ssh` which `stitch tunnel`
 /// runs: the generated `ProxyCommand`s quote `%h`, so the shell which runs

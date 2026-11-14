@@ -24,7 +24,9 @@ use crate::handshake::{self, ErrorCode, ErrorReply, HandshakeError, Message, Tar
 use crate::runtime::{App, Channel, Event, Pump};
 
 mod policy;
+mod stderr;
 use policy::{HANGUP_TIMEOUT, ResumePolicy};
+use stderr::SshStderr;
 
 /// How long to wait for `ssh` to exit by itself once the session has
 /// finished, before killing it.
@@ -58,9 +60,14 @@ pub struct TunnelArgs {
 ///
 /// Contract (from `doc/implementation.md`, "Client side"):
 /// - Spawns `<ssh> [-o OPT]... -T <host> <remote_stitch> _server-shim`, using
-///   the child's stdin/stdout as the channel and inheriting its stderr. Sends
-///   an `open` (epoch 0) and waits, with no timeout of its own, for the reply;
-///   if the open fails, returns an error (non-zero exit).
+///   the child's stdin/stdout as the channel. Sends an `open` (epoch 0) and
+///   waits, with no timeout of its own, for the reply; if the open fails,
+///   returns an error (non-zero exit).
+/// - Captures each `ssh`'s stderr until its handshake is done. If the open
+///   fails, copies what its `ssh` wrote to our stderr, for the user; if a
+///   resume fails, logs it (at `info`). Once a handshake has succeeded,
+///   that `ssh`'s output is only logged (at `debug`), so that it does not
+///   land in the middle of the user's session.
 /// - Resumes (new `ssh`, `resume` message with the next epoch) when the
 ///   channel reaches EOF or errors, the session reports a transport timeout,
 ///   or the active `ssh` has exited and the channel has not reached EOF
@@ -112,7 +119,8 @@ fn ssh_args(args: &TunnelArgs) -> Vec<OsString> {
 
 /// Runs `ssh` to the host, sends `msg` to the shim, and reads its reply.
 /// Returns the `ssh` process, the channel (its stdout and stdin), and the
-/// reply.
+/// reply. The `ssh`'s stderr is captured into `stderr`, whatever the
+/// outcome.
 ///
 /// The `ssh` runs with `SIGHUP` ignored (which OpenSSH respects: it leaves
 /// an ignored `SIGHUP` alone). It shares our process group, so when the
@@ -128,12 +136,16 @@ fn ssh_args(args: &TunnelArgs) -> Vec<OsString> {
 /// of a version we do not support is an error here, whose cause is a
 /// [`HandshakeError::UnsupportedVersion`], unless it is an `error` reply,
 /// which is returned as it is.
-async fn handshake(args: &TunnelArgs, msg: &Message) -> anyhow::Result<(Child, Channel, Message)> {
+async fn handshake(
+    args: &TunnelArgs,
+    msg: &Message,
+    stderr: &mut SshStderr,
+) -> anyhow::Result<(Child, Channel, Message)> {
     let mut cmd = Command::new(&args.ssh);
     cmd.args(ssh_args(args))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     // SAFETY: the closure runs between `fork` and `exec`, and makes only an
     // async-signal-safe call (`signal`).
@@ -148,6 +160,7 @@ async fn handshake(args: &TunnelArgs, msg: &Message) -> anyhow::Result<(Child, C
         .with_context(|| format!("cannot run {}", args.ssh.to_string_lossy()))?;
     let mut stdin = child.stdin.take().expect("piped");
     let mut stdout = child.stdout.take().expect("piped");
+    stderr.capture(child.stderr.take().expect("piped"));
     // If ssh has already failed, writing may fail; the read below then
     // reports it.
     if let Err(e) = handshake::write_message_async(&mut stdin, msg).await {
@@ -192,18 +205,34 @@ async fn resume_attempt(
     epoch: u64,
 ) -> AttemptResult {
     let msg = Message::resume(session.clone(), socket, epoch);
-    let result = tokio::time::timeout(args.connect_timeout, handshake(&args, &msg)).await;
+    let mut stderr = SshStderr::new();
+    let result =
+        tokio::time::timeout(args.connect_timeout, handshake(&args, &msg, &mut stderr)).await;
+    // Any `ssh` which did not succeed is dropped (and so killed) here.
+    let result = check_resume_reply(result, &session, args.connect_timeout);
+    match result {
+        Ok(_) => stderr.discard(),
+        Err(_) => stderr.log().await,
+    }
+    result
+}
+
+/// Classifies the outcome of a resume handshake for `session`.
+fn check_resume_reply(
+    result: Result<anyhow::Result<(Child, Channel, Message)>, tokio::time::error::Elapsed>,
+    session: &str,
+    connect_timeout: Duration,
+) -> AttemptResult {
     match result {
         Err(_) => Err(AttemptError::Failed(anyhow!(
-            "no reply within {:?}",
-            args.connect_timeout
+            "no reply within {connect_timeout:?}"
         ))),
         Ok(Err(e)) => Err(match e.downcast_ref::<HandshakeError>() {
             Some(HandshakeError::UnsupportedVersion(_)) => AttemptError::Incompatible(e),
             _ => AttemptError::Failed(e),
         }),
         Ok(Ok((child, channel, reply))) => match reply {
-            Message::Ok(ok) if ok.session == session => Ok((child, channel)),
+            Message::Ok(ok) if ok.session == *session => Ok((child, channel)),
             // Whatever answered at our socket is not our session, and
             // trying again would only reach it again.
             Message::Ok(ok) => Err(AttemptError::Rejected(ErrorReply {
@@ -292,14 +321,27 @@ impl Client {
         // wait for us forever. Our own `ssh` ignores SIGHUP (see
         // `handshake`), so the channel is normally still there to do it on.
         let mut hangup = signal_stream(SignalKind::hangup())?;
-        let (child, channel, reply) = tokio::select! {
-            r = handshake(&args, &open) => r.context("cannot open the session")?,
-            _ = hangup.recv() => bail!("hung up while opening the session"),
+        let mut stderr = SshStderr::new();
+        let opened = tokio::select! {
+            r = handshake(&args, &open, &mut stderr) => r.context("cannot open the session"),
+            _ = hangup.recv() => Err(anyhow!("hung up while opening the session")),
         };
-        let (session, socket) = match reply {
-            Message::Ok(ok) => (ok.session, ok.socket),
+        // Any `ssh` which did not succeed is dropped (and so killed) here.
+        let opened = opened.and_then(|(child, channel, reply)| match reply {
+            Message::Ok(ok) => Ok((child, channel, ok.session, ok.socket)),
             Message::Error(e) => bail!("cannot open the session: {}: {}", e.code, e.message),
             other => bail!("cannot open the session: unexpected reply {other:?}"),
+        });
+        let (child, channel, session, socket) = match opened {
+            Ok(opened) => {
+                stderr.discard();
+                opened
+            }
+            Err(e) => {
+                // Most likely, ssh has said why.
+                stderr.report().await;
+                return Err(e);
+            }
         };
         log::info!("opened session {session}");
 
