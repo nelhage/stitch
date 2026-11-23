@@ -46,14 +46,19 @@ jobs:
             '(builtins.getFlake (toString ./.)).inputs.nixpkgs.legacyPackages.x86_64-linux.rustc.version')
           echo "rustc $version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      # Releases are numbered 0.x.0 in Cargo.toml and tagged v0.x; the full
+      # form (v0.x.0) is accepted too.
       - name: Check that the tag matches the crate version
         if: env.PUBLISH == 'true'
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "stitch") | .version')
-          if [ "$TAG" != "v$version" ]; then
-            echo "::error::Tag $TAG does not match Cargo.toml version $version"
-            exit 1
-          fi
+          case "$TAG" in
+            "v$version" | "v${version%.0}") ;;
+            *)
+              echo "::error::Tag $TAG does not match Cargo.toml version $version"
+              exit 1
+              ;;
+          esac
       - name: Create draft release
         if: env.PUBLISH == 'true'
         env:
