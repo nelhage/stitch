@@ -128,7 +128,8 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          tar -C "target/$TARGET/release" -czf "dist/stitch-$TARGET.tar.gz" stitch
+          tar -czf "dist/stitch-$TARGET.tar.gz" -C "target/$TARGET/release" stitch -C "$PWD" LICENSE
+          tar -tzvf "dist/stitch-$TARGET.tar.gz"
           ls -l dist
       - name: Upload to release
         if: env.PUBLISH == 'true'
