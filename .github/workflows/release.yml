@@ -39,11 +39,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
+      # `--inputs-from .` resolves `nixpkgs` to the flake's locked nixpkgs
+      # input. (`builtins.getFlake` on the checkout's path does not work:
+      # pure evaluation refuses a path flake reference, which is unlocked.)
       - id: rust
         name: Find the flake's rustc version
         run: |
-          version=$(nix eval --raw --expr \
-            '(builtins.getFlake (toString ./.)).inputs.nixpkgs.legacyPackages.x86_64-linux.rustc.version')
+          version=$(nix eval --raw --inputs-from . \
+            nixpkgs#legacyPackages.x86_64-linux.rustc.version)
           echo "rustc $version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
       # Releases are numbered 0.x.0 in Cargo.toml and tagged v0.x; the full
