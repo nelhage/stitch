@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Cut a release of stitch and bump the version on main.
+#
+# Releases are numbered 0.x.0 in Cargo.toml and tagged v0.x. Cutting a
+# release:
+#
+#   1. Tags the current `main` (which must match origin/main, and carry
+#      version 0.x.0) with an annotated tag v0.x.
+#   2. Commits a bump to 0.(x+1).0 on a new branch, off that same commit.
+#   3. Pushes the tag and the branch to origin; pushing the tag triggers the
+#      release workflow (.github/workflows/release.yml).
+#   4. Opens a PR for the version bump.
+#
+# With -n/--dry-run, the tag and the branch are created locally, but nothing
+# is pushed and no PR is opened.
+#
+# A local tag or branch left over from an earlier (e.g. dry) run is
+# overwritten, but if either already exists on origin, the script refuses to
+# continue.
+#
+# The bump is made in a temporary worktree, so your checkout is left alone.
+
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: $0 [-n|--dry-run]
+
+Tag main as the release v0.x (matching its version 0.x.0), and open a PR
+bumping the version to 0.(x+1).0.
+
+  -n, --dry-run   Create the tag and the bump branch locally, but do not push
+                  them or open a PR.
+  -h, --help      Show this help.
+EOF
+}
+
+dry_run=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n | --dry-run) dry_run=1 ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+log() {
+    echo "==> $*" >&2
+}
+
+remote=origin
+base=main
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Make sure we tag what is actually on the remote's main; tagging a commit
+# which isn't there would publish it via the tag.
+log "Fetching $remote"
+git fetch --quiet "$remote" "+refs/heads/$base:refs/remotes/$remote/$base"
+commit=$(git rev-parse --verify "refs/heads/$base^{commit}")
+remote_commit=$(git rev-parse --verify "refs/remotes/$remote/$base^{commit}")
+if [ "$commit" != "$remote_commit" ]; then
+    die "local $base ($(git rev-parse --short "$commit")) does not match $remote/$base ($(git rev-parse --short "$remote_commit")); update it first"
+fi
+
+# The version of the stitch package, as committed on main.
+version=$(git show "$commit:Cargo.toml" |
+    sed -n '/^\[package\]/,/^\[/ s/^version *= *"\(.*\)"/\1/p' | head -n1)
+if ! [[ "$version" =~ ^0\.([0-9]+)\.0$ ]]; then
+    die "version on $base is '$version', not of the form 0.x.0"
+fi
+minor=${BASH_REMATCH[1]}
+next_minor=$((minor + 1))
+next_version="0.$next_minor.0"
+tag="v0.$minor"
+branch="release/bump-$next_version"
+
+# Releases must go up: refuse to cut one at or below an existing release.
+latest=$(git ls-remote --tags --refs "$remote" 'v0.*' |
+    sed -n 's|.*refs/tags/v0\.\([0-9][0-9]*\)\(\.0\)\{0,1\}$|\1|p' |
+    sort -n | tail -n1)
+if [ -n "$latest" ] && [ "$latest" -ge "$minor" ]; then
+    die "$remote already has release v0.$latest, but $base is at version $version; is $base's version stale?"
+fi
+
+# Refuse to clobber anything already published; local leftovers are fair
+# game.
+if [ -n "$(git ls-remote "$remote" "refs/tags/$tag")" ]; then
+    die "tag $tag already exists on $remote"
+fi
+if [ -n "$(git ls-remote "$remote" "refs/heads/$branch")" ]; then
+    die "branch $branch already exists on $remote"
+fi
+
+log "Releasing $tag at $(git log -1 --format='%h %s' "$commit")"
+
+# Tag the release.
+if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+    log "Overwriting local tag $tag"
+fi
+git tag --force --annotate --message "stitch $tag" "$tag" "$commit" >/dev/null
+
+# Commit the version bump in a scratch worktree.
+worktree=$(mktemp -d "${TMPDIR:-/tmp}/stitch-release.XXXXXX")
+cleanup() {
+    git worktree remove --force "$worktree" 2>/dev/null || rm -rf "$worktree"
+}
+trap cleanup EXIT
+git worktree add --quiet --detach "$worktree" "$commit"
+
+(
+    cd "$worktree"
+    # Cargo.toml: the version in [package].
+    sed -i.bak "/^\[package\]/,/^\[/ s/^version = \"$version\"\$/version = \"$next_version\"/" Cargo.toml
+    # Cargo.lock: the version following `name = "stitch"`.
+    sed -i.bak "/^name = \"stitch\"\$/{n;s/^version = \"$version\"\$/version = \"$next_version\"/;}" Cargo.lock
+    rm -f Cargo.toml.bak Cargo.lock.bak
+
+    # Each file should have changed exactly one line.
+    for f in Cargo.toml Cargo.lock; do
+        changed=$(git diff --numstat -- "$f" | cut -f1)
+        if [ "$changed" != 1 ]; then
+            git diff -- "$f" >&2
+            die "failed to bump the version in $f"
+        fi
+    done
+
+    git commit --quiet --all --message "Bump version to $next_version
+
+$tag has been released; main is now the development version of the next
+release."
+)
+bump_commit=$(git -C "$worktree" rev-parse HEAD)
+
+if git rev-parse --verify --quiet "refs/heads/$branch" >/dev/null; then
+    log "Overwriting local branch $branch"
+fi
+git branch --force "$branch" "$bump_commit"
+
+log "Created tag $tag ($(git rev-parse --short "$commit"))"
+log "Created branch $branch ($(git rev-parse --short "$bump_commit")): $version -> $next_version"
+
+if [ -n "$dry_run" ]; then
+    log "Dry run; not pushing. To publish, run $0 again without --dry-run."
+    exit 0
+fi
+
+log "Pushing $tag and $branch to $remote"
+git push --atomic "$remote" "refs/tags/$tag:refs/tags/$tag" "refs/heads/$branch:refs/heads/$branch"
+
+log "Opening PR"
+gh pr create --base "$base" --head "$branch" \
+    --title "Bump version to $next_version" \
+    --body "$tag has been tagged and pushed, which starts the release workflow. This bumps the version on \`$base\` to $next_version, so that it is ahead of the latest release."
